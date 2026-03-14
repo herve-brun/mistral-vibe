@@ -32,6 +32,7 @@ class BannerState:
     mcp_servers_count: int = 0
     connectors_count: int = 0
     skills_count: int = 0
+    plugins_count: int = 0
     plan_description: str | None = None
 
 
@@ -54,6 +55,7 @@ class Banner(Static):
             mcp_servers_count=mcp_registry.count_loaded(config.mcp_servers),
             connectors_count=_connector_count(connector_registry),
             skills_count=skill_manager.custom_skills_count,
+            plugins_count=0,  # Will be updated later
             plan_description=None,
         )
         self._animated = not config.disable_welcome_banner_animation
@@ -98,6 +100,7 @@ class Banner(Static):
         skill_manager: SkillManager,
         mcp_registry: MCPRegistry,
         connector_registry: ConnectorRegistry | None = None,
+        plugin_manager: Any = None,
         plan_description: str | None = None,
     ) -> None:
         self.state = BannerState(
@@ -106,6 +109,7 @@ class Banner(Static):
             mcp_servers_count=mcp_registry.count_loaded(config.mcp_servers),
             connectors_count=_connector_count(connector_registry),
             skills_count=skill_manager.custom_skills_count,
+            plugins_count=len(plugin_manager.all_plugins) if plugin_manager else 0,
             plan_description=plan_description,
         )
 
@@ -115,6 +119,7 @@ class Banner(Static):
             parts.append(_pluralize(self.state.connectors_count, "connector"))
         parts.append(_pluralize(self.state.mcp_servers_count, "MCP server"))
         parts.append(_pluralize(self.state.skills_count, "skill"))
+        parts.append(_pluralize(self.state.plugins_count, "plugin"))
         return " · ".join(parts)
 
     def _format_plan(self) -> str:

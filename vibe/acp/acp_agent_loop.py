@@ -297,6 +297,7 @@ class VibeAcpAgentLoop(AcpAgent):
                 entrypoint_metadata=self._build_entrypoint_metadata(),
                 defer_heavy_init=True,
             )
+
             agent_loop.agent_manager.register_agent(CHAT_AGENT)
             # NOTE: For now, we pin session.id to agent_loop.session_id right after init time.
             # We should just use agent_loop.session_id everywhere, but it can still change during
@@ -305,8 +306,6 @@ class VibeAcpAgentLoop(AcpAgent):
             session = await self._create_acp_session(agent_loop.session_id, agent_loop)
         except Exception as e:
             raise ConfigurationError(str(e)) from e
-
-        agent_loop.emit_new_session_telemetry()
 
         modes_state, modes_config = make_mode_response(
             list(agent_loop.agent_manager.available_agents.values()),
