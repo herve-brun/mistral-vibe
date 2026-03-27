@@ -205,10 +205,10 @@ class PluginManager:
         classes: list[type[VibePlugin]] = []
 
         for py_file in sorted(pkg_path.rglob("plugin.py")):
-            # e.g. vibe/core/plugins/builtin/lsp/plugin.py
-            # → vibe.core.plugins.builtin.lsp.plugin
-            rel = py_file.relative_to(pkg_path.parent.parent.parent.parent)
-            mod_name = ".".join(rel.with_suffix("").parts)
+            # Calculate module name from package structure
+            # e.g. vibe/core/plugins/builtin/lsp/plugin.py → vibe.core.plugins.builtin.lsp.plugin
+            rel = py_file.relative_to(pkg_path)
+            mod_name = f"{package_name}.{'.'.join(rel.with_suffix('').parts)}"
             classes.extend(PluginManager._load_classes_from_module_name(mod_name))
 
         return classes
