@@ -81,6 +81,8 @@ class ToolManager:
         self._mcp_registry = mcp_registry or MCPRegistry()
         self._connector_registry = connector_registry
         self._instances: dict[str, BaseTool] = {}
+        # Track which tools came from plugins (for filtering)
+        self._plugin_tools: set[str] = set()
         self._search_paths: list[Path] = self._compute_search_paths(self._config)
         self._lock = threading.Lock()
         self._mcp_integrated = False
@@ -197,19 +199,42 @@ class ToolManager:
                 name: cls for name, cls in self._available.items() if cls.is_available()
             }
 
+        # Apply general tool filtering first
+        filtered_by_general = runtime_available
         if self._config.enabled_tools:
-            return {
+            filtered_by_general = {
                 name: cls
                 for name, cls in runtime_available.items()
                 if name_matches(name, self._config.enabled_tools)
             }
-        if self._config.disabled_tools:
-            return {
+        elif self._config.disabled_tools:
+            filtered_by_general = {
                 name: cls
                 for name, cls in runtime_available.items()
                 if not name_matches(name, self._config.disabled_tools)
             }
-        return runtime_available
+
+        # Apply plugin-specific filtering
+        result = {}
+        for name, cls in filtered_by_general.items():
+            is_plugin_tool = name in self._plugin_tools
+            
+            if is_plugin_tool:
+                # Plugin tool - apply plugin-specific config
+                if self._config.enabled_plugin_tools:
+                    if name_matches(name, self._config.enabled_plugin_tools):
+                        result[name] = cls
+                elif self._config.disabled_plugin_tools:
+                    if not name_matches(name, self._config.disabled_plugin_tools):
+                        result[name] = cls
+                else:
+                    # No plugin-specific config - include by default
+                    result[name] = cls
+            else:
+                # Built-in tool - already filtered above
+                result[name] = cls
+        
+        return result
 
     def integrate_mcp(self, *, raise_on_failure: bool = False) -> None:
         """Discover and register MCP tools (sync wrapper).
@@ -384,4 +409,7 @@ class ToolManager:
 
         Used by plugins to inject tools that aren't discovered from files.
         """
-        self._available[tool_class.get_name()] = tool_class
+        tool_name = tool_class.get_name()
+        self._available[tool_name] = tool_class
+        # Mark this tool as coming from a plugin
+        self._plugin_tools.add(tool_name)

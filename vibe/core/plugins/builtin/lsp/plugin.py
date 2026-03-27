@@ -109,7 +109,9 @@ class LspPlugin(ToolEventPlugin):
 
         # 2. Start clients for each detected language (non-blocking)
         if self._detected_languages:
-            tasks = [self._start_client(lang, workdir) for lang in self._detected_languages]
+            tasks = [
+                self._start_client(lang, workdir) for lang in self._detected_languages
+            ]
             await asyncio.gather(*tasks, return_exceptions=True)
 
         # 3. Register LSP tools into Vibe's ToolManager (even if clients not ready yet)
@@ -123,7 +125,7 @@ class LspPlugin(ToolEventPlugin):
 
     def is_applicable(self, context: PluginContext) -> bool:
         """Active only when at least one supported language is present."""
-        langs = detect_languages_in_dir(context.workdir, max_files=200)
+        langs = detect_languages_in_dir(context.workdir, max_files=1000)
         return bool(langs)
 
     # ── ToolEventPlugin hooks ─────────────────────────────────────────────────

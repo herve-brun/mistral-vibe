@@ -8,6 +8,7 @@ from enum import StrEnum, auto
 from functools import wraps
 from http import HTTPStatus
 import inspect
+import logging
 import os
 from pathlib import Path
 import threading
@@ -180,6 +181,9 @@ def requires_init(fn: Callable[..., Any]) -> Callable[..., Any]:
         return await fn(self, *args, **kwargs)
 
     return wrapper
+
+
+logger = logging.getLogger(__name__)
 
 
 class AgentLoop:
@@ -892,6 +896,7 @@ class AgentLoop:
             )
 
             # Execute the tool through _execute_tool (triggers plugin hooks)
+            logger.debug("About to call _execute_tool for %s", tool_call.tool_name)
             text_result = await self._execute_tool(
                 tool_call.tool_name, tool_call.args_dict, invoke_ctx
             )

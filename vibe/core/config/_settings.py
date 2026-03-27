@@ -532,6 +532,23 @@ class VibeConfig(BaseSettings):
             " is set. Supports glob patterns and regex with 're:' prefix."
         ),
     )
+    # Plugin-specific tool control
+    enabled_plugin_tools: list[str] = Field(
+        default_factory=list,
+        description=(
+            "An explicit list of plugin-provided tool names/patterns to enable. "
+            "If set, only these plugin tools will be active. Supports glob patterns "
+            "(e.g., 'lsp_*') and regex with 're:' prefix (e.g., 're:^lsp_.*')."
+        ),
+    )
+    disabled_plugin_tools: list[str] = Field(
+        default_factory=list,
+        description=(
+            "A list of plugin-provided tool names/patterns to disable. Ignored if "
+            "'enabled_plugin_tools' is set. Supports glob patterns and regex with "
+            "'re:' prefix."
+        ),
+    )
     agent_paths: list[Path] = Field(
         default_factory=list,
         description=(

@@ -104,6 +104,7 @@ class PluginManager:
             self._plugins.append(instance)
             if isinstance(instance, ToolEventPlugin):
                 self._tool_event_plugins.append(instance)
+                logger.debug("Registered tool event plugin: %s", instance.metadata().name)
 
             # Register commands if this plugin implements CommandPlugin
             if isinstance(instance, CommandPlugin) and self._command_registry:

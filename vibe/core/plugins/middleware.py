@@ -114,10 +114,12 @@ class PluginMiddleware:
         Safe to call multiple times; the loop is only patched once.
         """
         if self._patched_loop is loop:
+            logger.debug("AgentLoop already patched, skipping")
             return  # already patched
 
         original = loop._execute_tool  # type: ignore[attr-defined]
         context = self._context
+        logger.debug("Patching AgentLoop._execute_tool (found %d tool event plugins)", len(self._manager.tool_event_plugins))
 
         @functools.wraps(original)
         async def _wrapped(
@@ -154,7 +156,10 @@ class PluginMiddleware:
     async def _dispatch_on_tool_call(
         self, tool_name: str, arguments: dict[str, Any]
     ) -> None:
-        for plugin in self._manager.tool_event_plugins:
+        # Get current list of plugins each time (don't rely on closure)
+        plugins = self._manager.tool_event_plugins
+        logger.debug("Dispatching on_tool_call to %d plugins", len(plugins))
+        for plugin in plugins:
             try:
                 await plugin.on_tool_call(tool_name, arguments, self._context)
             except Exception:
@@ -167,7 +172,9 @@ class PluginMiddleware:
     async def _dispatch_on_tool_result(
         self, tool_name: str, arguments: dict[str, Any], result: str
     ) -> None:
-        for plugin in self._manager.tool_event_plugins:
+        # Get current list of plugins each time (don't rely on closure)
+        plugins = self._manager.tool_event_plugins
+        for plugin in plugins:
             try:
                 await plugin.on_tool_result(tool_name, arguments, result, self._context)
             except Exception:
