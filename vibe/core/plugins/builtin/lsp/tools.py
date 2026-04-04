@@ -30,9 +30,13 @@ from collections.abc import AsyncGenerator
 import functools
 import json
 import logging
-from typing import TYPE_CHECKING, Any, ClassVar
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from pydantic import BaseModel, Field
 
 from vibe.core.tools.base import BaseTool  # type: ignore[import]
+from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
 from vibe.core.types import ToolStreamEvent  # type: ignore[import]
 
 if TYPE_CHECKING:
@@ -46,6 +50,74 @@ logger = logging.getLogger(__name__)
 _LINE_DOC = "1-indexed line number."
 _COL_DOC = "1-indexed column number."
 _MISSING_PARAMS_MSG = "Missing required parameters: file_path, line, col"
+
+
+# Pydantic models for LSP tool arguments and results
+class LspDiagnosticsArgs(BaseModel):
+    file_path: str = Field(
+        description="Path to the file to analyse (absolute or relative to workdir)."
+    )
+
+
+class LspDiagnosticsResult(BaseModel):
+    diagnostics: list[dict[str, Any]] | None = Field(default=None)
+    message: str
+
+
+class LspCompletionArgs(BaseModel):
+    file_path: str = Field(description="Path to the source file.")
+    line: int = Field(description=_LINE_DOC)
+    col: int = Field(description=_COL_DOC)
+
+
+class LspCompletionResult(BaseModel):
+    items: list[dict[str, Any]] | None = Field(default=None)
+    message: str
+
+
+class LspHoverArgs(BaseModel):
+    file_path: str = Field(description="Path to the source file.")
+    line: int = Field(description=_LINE_DOC)
+    col: int = Field(description=_COL_DOC)
+
+
+class LspHoverResult(BaseModel):
+    content: str | None = Field(default=None)
+    message: str
+
+
+class LspDefinitionArgs(BaseModel):
+    file_path: str = Field(description="Path to the source file.")
+    line: int = Field(description=_LINE_DOC)
+    col: int = Field(description=_COL_DOC)
+
+
+class LspDefinitionResult(BaseModel):
+    locations: list[dict[str, Any]] | None = Field(default=None)
+    message: str
+
+
+class LspReferencesArgs(BaseModel):
+    file_path: str = Field(description="Path to the source file.")
+    line: int = Field(description=_LINE_DOC)
+    col: int = Field(description=_COL_DOC)
+    include_declaration: bool = Field(
+        default=True,
+        description="Whether to include the declaration itself in the results.",
+    )
+
+
+class LspReferencesResult(BaseModel):
+    references: list[dict[str, Any]] | None = Field(default=None)
+    message: str
+
+
+class LspStatusArgs(BaseModel):
+    pass
+
+
+class LspStatusResult(BaseModel):
+    status: dict[str, Any]
 
 
 # ── Base class for all LSP tools ──────────────────────────────────────────────
@@ -78,31 +150,27 @@ class _LspBaseTool(BaseTool):
             f"Check that the server is installed and the plugin is active."
         )
 
+    @classmethod
+    def get_status_text(cls) -> str:
+        return "Querying LSP server"
+
 
 # ── lsp_diagnostics ───────────────────────────────────────────────────────────
 
 
-class LspDiagnosticsTool(_LspBaseTool):
+class LspDiagnosticsTool(
+    _LspBaseTool, ToolUIData[LspDiagnosticsArgs, LspDiagnosticsResult]
+):
     name = "lsp_diagnostics"
     description = (
         "Get diagnostics (errors, warnings, hints) for a file from its Language Server. "
         "Use this after writing or modifying a file to verify there are no semantic errors."
     )
-    input_schema: ClassVar[dict[str, Any]] = {
-        "type": "object",
-        "properties": {
-            "file_path": {
-                "type": "string",
-                "description": "Path to the file to analyse (absolute or relative to workdir).",
-            }
-        },
-        "required": ["file_path"],
-    }
 
     async def run(
-        self, args: dict[str, Any], ctx: InvokeContext | None = None
+        self, args: LspDiagnosticsArgs, ctx: InvokeContext | None = None
     ) -> AsyncGenerator[ToolStreamEvent | str, None]:
-        if not isinstance(args, dict) or "file_path" not in args:
+        if not isinstance(args, LspDiagnosticsArgs):
             yield ToolStreamEvent(
                 tool_name=self.get_name(),
                 message=_MISSING_PARAMS_MSG,
@@ -110,7 +178,7 @@ class LspDiagnosticsTool(_LspBaseTool):
             )
             return
 
-        file_path = args["file_path"]
+        file_path = args.file_path
         client = self._client_for(file_path)
         if client is None:
             yield self._no_client_msg(file_path)
@@ -120,10 +188,34 @@ class LspDiagnosticsTool(_LspBaseTool):
         except Exception as exc:
             yield f"LSP error: {exc}"
             return
-        if not diags:
-            yield "✓ No diagnostics — file looks clean."
-        else:
-            yield json.dumps(diags, indent=2, ensure_ascii=False)
+
+        message = (
+            "✓ No diagnostics — file looks clean."
+            if not diags
+            else json.dumps(diags, indent=2, ensure_ascii=False)
+        )
+        result = LspDiagnosticsResult(
+            diagnostics=diags if diags else None, message=message
+        )
+        yield result
+
+    @classmethod
+    def format_call_display(cls, args: LspDiagnosticsArgs) -> ToolCallDisplay:
+        return ToolCallDisplay(summary=f"Checking diagnostics for {args.file_path}")
+
+    @classmethod
+    def get_result_display(cls, event: Any) -> ToolResultDisplay:
+        if not isinstance(event.result, LspDiagnosticsResult):
+            return ToolResultDisplay(
+                success=False, message=event.error or event.skip_reason or "No result"
+            )
+
+        if event.result.diagnostics:
+            return ToolResultDisplay(
+                success=True,
+                message=f"Found {len(event.result.diagnostics)} diagnostics in {Path(event.result.diagnostics[0].get('file_path', '')).name}",
+            )
+        return ToolResultDisplay(success=True, message=event.result.message)
 
     @classmethod
     @functools.cache
@@ -137,31 +229,19 @@ class LspDiagnosticsTool(_LspBaseTool):
 # ── lsp_completion ────────────────────────────────────────────────────────────
 
 
-class LspCompletionTool(_LspBaseTool):
+class LspCompletionTool(
+    _LspBaseTool, ToolUIData[LspCompletionArgs, LspCompletionResult]
+):
     name = "lsp_completion"
     description = (
         "Get code completion suggestions at a position in a file. "
         "Use to explore available methods, properties, or identifiers."
     )
-    input_schema: ClassVar[dict[str, Any]] = {
-        "type": "object",
-        "properties": {
-            "file_path": {"type": "string", "description": "Path to the source file."},
-            "line": {"type": "integer", "description": _LINE_DOC},
-            "col": {"type": "integer", "description": _COL_DOC},
-        },
-        "required": ["file_path", "line", "col"],
-    }
 
     async def run(
-        self, args: Any, ctx: InvokeContext | None = None
+        self, args: LspCompletionArgs, ctx: InvokeContext | None = None
     ) -> AsyncGenerator[ToolStreamEvent | str, None]:
-        if (
-            not isinstance(args, dict)
-            or "file_path" not in args
-            or "line" not in args
-            or "col" not in args
-        ):
+        if not isinstance(args, LspCompletionArgs):
             yield ToolStreamEvent(
                 tool_name=self.get_name(),
                 message="Missing required parameters: file_path, line, col",
@@ -169,9 +249,9 @@ class LspCompletionTool(_LspBaseTool):
             )
             return
 
-        file_path = args["file_path"]
-        line = int(args["line"])
-        col = int(args["col"])
+        file_path = args.file_path
+        line = args.line
+        col = args.col
         client = self._client_for(file_path)
         if client is None:
             yield self._no_client_msg(file_path)
@@ -181,10 +261,34 @@ class LspCompletionTool(_LspBaseTool):
         except Exception as exc:
             yield f"LSP error: {exc}"
             return
-        if not items:
-            yield "No completion suggestions at this position."
-        else:
-            yield json.dumps(items, indent=2, ensure_ascii=False)
+
+        message = (
+            "No completion suggestions at this position."
+            if not items
+            else json.dumps(items, indent=2, ensure_ascii=False)
+        )
+        result = LspCompletionResult(items=items if items else None, message=message)
+        yield result
+
+    @classmethod
+    def format_call_display(cls, args: LspCompletionArgs) -> ToolCallDisplay:
+        return ToolCallDisplay(
+            summary=f"Getting completions at {args.file_path}:{args.line}:{args.col}"
+        )
+
+    @classmethod
+    def get_result_display(cls, event: Any) -> ToolResultDisplay:
+        if not isinstance(event.result, LspCompletionResult):
+            return ToolResultDisplay(
+                success=False, message=event.error or event.skip_reason or "No result"
+            )
+
+        if event.result.items and len(event.result.items) > 0:
+            return ToolResultDisplay(
+                success=True,
+                message=f"Found {len(event.result.items)} completion suggestions",
+            )
+        return ToolResultDisplay(success=True, message=event.result.message)
 
     @classmethod
     @functools.cache
@@ -198,31 +302,17 @@ class LspCompletionTool(_LspBaseTool):
 # ── lsp_hover ─────────────────────────────────────────────────────────────────
 
 
-class LspHoverTool(_LspBaseTool):
+class LspHoverTool(_LspBaseTool, ToolUIData[LspHoverArgs, LspHoverResult]):
     name = "lsp_hover"
     description = (
         "Get the type signature and documentation of a symbol at a position. "
         "Use before modifying a function or class to understand its contract."
     )
-    input_schema: ClassVar[dict[str, Any]] = {
-        "type": "object",
-        "properties": {
-            "file_path": {"type": "string"},
-            "line": {"type": "integer", "description": _LINE_DOC},
-            "col": {"type": "integer", "description": _COL_DOC},
-        },
-        "required": ["file_path", "line", "col"],
-    }
 
     async def run(
-        self, args: Any, ctx: InvokeContext | None = None
+        self, args: LspHoverArgs, ctx: InvokeContext | None = None
     ) -> AsyncGenerator[ToolStreamEvent | str, None]:
-        if (
-            not isinstance(args, dict)
-            or "file_path" not in args
-            or "line" not in args
-            or "col" not in args
-        ):
+        if not isinstance(args, LspHoverArgs):
             yield ToolStreamEvent(
                 tool_name=self.get_name(),
                 message="Missing required parameters: file_path, line, col",
@@ -230,9 +320,9 @@ class LspHoverTool(_LspBaseTool):
             )
             return
 
-        file_path = args["file_path"]
-        line = int(args["line"])
-        col = int(args["col"])
+        file_path = args.file_path
+        line = args.line
+        col = args.col
         client = self._client_for(file_path)
         if client is None:
             yield self._no_client_msg(file_path)
@@ -242,8 +332,25 @@ class LspHoverTool(_LspBaseTool):
         except Exception as exc:
             yield f"LSP error: {exc}"
             return
-        result = info.get("content") or "No hover information at this position."
+
+        content = info.get("content") or "No hover information at this position."
+        result = LspHoverResult(content=content, message=content)
         yield result
+
+    @classmethod
+    def format_call_display(cls, args: LspHoverArgs) -> ToolCallDisplay:
+        return ToolCallDisplay(
+            summary=f"Getting hover info at {args.file_path}:{args.line}:{args.col}"
+        )
+
+    @classmethod
+    def get_result_display(cls, event: Any) -> ToolResultDisplay:
+        if not isinstance(event.result, LspHoverResult):
+            return ToolResultDisplay(
+                success=False, message=event.error or event.skip_reason or "No result"
+            )
+
+        return ToolResultDisplay(success=True, message="Hover information retrieved")
 
     @classmethod
     @functools.cache
@@ -257,31 +364,19 @@ class LspHoverTool(_LspBaseTool):
 # ── lsp_definition ────────────────────────────────────────────────────────────
 
 
-class LspDefinitionTool(_LspBaseTool):
+class LspDefinitionTool(
+    _LspBaseTool, ToolUIData[LspDefinitionArgs, LspDefinitionResult]
+):
     name = "lsp_definition"
     description = (
         "Go to the definition of a symbol. "
         "Returns the file, line and column where the symbol is defined."
     )
-    input_schema: ClassVar[dict[str, Any]] = {
-        "type": "object",
-        "properties": {
-            "file_path": {"type": "string"},
-            "line": {"type": "integer", "description": _LINE_DOC},
-            "col": {"type": "integer", "description": _COL_DOC},
-        },
-        "required": ["file_path", "line", "col"],
-    }
 
     async def run(
-        self, args: Any, ctx: InvokeContext | None = None
+        self, args: LspDefinitionArgs, ctx: InvokeContext | None = None
     ) -> AsyncGenerator[ToolStreamEvent | str, None]:
-        if (
-            not isinstance(args, dict)
-            or "file_path" not in args
-            or "line" not in args
-            or "col" not in args
-        ):
+        if not isinstance(args, LspDefinitionArgs):
             yield ToolStreamEvent(
                 tool_name=self.get_name(),
                 message="Missing required parameters: file_path, line, col",
@@ -289,9 +384,9 @@ class LspDefinitionTool(_LspBaseTool):
             )
             return
 
-        file_path = args["file_path"]
-        line = int(args["line"])
-        col = int(args["col"])
+        file_path = args.file_path
+        line = args.line
+        col = args.col
         client = self._client_for(file_path)
         if client is None:
             yield self._no_client_msg(file_path)
@@ -301,10 +396,34 @@ class LspDefinitionTool(_LspBaseTool):
         except Exception as exc:
             yield f"LSP error: {exc}"
             return
-        if not locs:
-            yield "No definition found."
-        else:
-            yield json.dumps(locs, indent=2, ensure_ascii=False)
+
+        message = (
+            "No definition found."
+            if not locs
+            else json.dumps(locs, indent=2, ensure_ascii=False)
+        )
+        result = LspDefinitionResult(locations=locs if locs else None, message=message)
+        yield result
+
+    @classmethod
+    def format_call_display(cls, args: LspDefinitionArgs) -> ToolCallDisplay:
+        return ToolCallDisplay(
+            summary=f"Finding definition at {args.file_path}:{args.line}:{args.col}"
+        )
+
+    @classmethod
+    def get_result_display(cls, event: Any) -> ToolResultDisplay:
+        if not isinstance(event.result, LspDefinitionResult):
+            return ToolResultDisplay(
+                success=False, message=event.error or event.skip_reason or "No result"
+            )
+
+        if event.result.locations and len(event.result.locations) > 0:
+            return ToolResultDisplay(
+                success=True,
+                message=f"Found definition in {Path(event.result.locations[0].get('file_path', '')).name}",
+            )
+        return ToolResultDisplay(success=True, message=event.result.message)
 
     @classmethod
     @functools.cache
@@ -315,36 +434,19 @@ class LspDefinitionTool(_LspBaseTool):
 # ── lsp_references ────────────────────────────────────────────────────────────
 
 
-class LspReferencesTool(_LspBaseTool):
+class LspReferencesTool(
+    _LspBaseTool, ToolUIData[LspReferencesArgs, LspReferencesResult]
+):
     name = "lsp_references"
     description = (
         "Find all references to a symbol across the project. "
         "Use before renaming or deleting a symbol to understand its impact."
     )
-    input_schema: ClassVar[dict[str, Any]] = {
-        "type": "object",
-        "properties": {
-            "file_path": {"type": "string"},
-            "line": {"type": "integer", "description": _LINE_DOC},
-            "col": {"type": "integer", "description": _COL_DOC},
-            "include_declaration": {
-                "type": "boolean",
-                "default": True,
-                "description": "Whether to include the declaration itself in the results.",
-            },
-        },
-        "required": ["file_path", "line", "col"],
-    }
 
     async def run(
-        self, args: dict[str, Any], ctx: InvokeContext | None = None
+        self, args: LspReferencesArgs, ctx: InvokeContext | None = None
     ) -> AsyncGenerator[ToolStreamEvent | str, None]:
-        if (
-            not isinstance(args, dict)
-            or "file_path" not in args
-            or "line" not in args
-            or "col" not in args
-        ):
+        if not isinstance(args, LspReferencesArgs):
             yield ToolStreamEvent(
                 tool_name=self.get_name(),
                 message=_MISSING_PARAMS_MSG,
@@ -352,10 +454,10 @@ class LspReferencesTool(_LspBaseTool):
             )
             return
 
-        file_path = args["file_path"]
-        line = int(args["line"])
-        col = int(args["col"])
-        include_declaration = args.get("include_declaration", True)
+        file_path = args.file_path
+        line = args.line
+        col = args.col
+        include_declaration = args.include_declaration
         client = self._client_for(file_path)
         if client is None:
             yield self._no_client_msg(file_path)
@@ -367,10 +469,33 @@ class LspReferencesTool(_LspBaseTool):
         except Exception as exc:
             yield f"LSP error: {exc}"
             return
-        if not refs:
-            yield "No references found."
-        else:
-            yield json.dumps(refs, indent=2, ensure_ascii=False)
+
+        message = (
+            "No references found."
+            if not refs
+            else json.dumps(refs, indent=2, ensure_ascii=False)
+        )
+        result = LspReferencesResult(references=refs if refs else None, message=message)
+        yield result
+
+    @classmethod
+    def format_call_display(cls, args: LspReferencesArgs) -> ToolCallDisplay:
+        return ToolCallDisplay(
+            summary=f"Finding references at {args.file_path}:{args.line}:{args.col}"
+        )
+
+    @classmethod
+    def get_result_display(cls, event: Any) -> ToolResultDisplay:
+        if not isinstance(event.result, LspReferencesResult):
+            return ToolResultDisplay(
+                success=False, message=event.error or event.skip_reason or "No result"
+            )
+
+        if event.result.references and len(event.result.references) > 0:
+            return ToolResultDisplay(
+                success=True, message=f"Found {len(event.result.references)} references"
+            )
+        return ToolResultDisplay(success=True, message=event.result.message)
 
     @classmethod
     @functools.cache
@@ -384,13 +509,12 @@ class LspReferencesTool(_LspBaseTool):
 # ── lsp_status ────────────────────────────────────────────────────────────────
 
 
-class LspStatusTool(BaseTool):
+class LspStatusTool(BaseTool, ToolUIData[LspStatusArgs, LspStatusResult]):
     name = "lsp_status"
     description = (
         "Show the status of the LSP plugin: which language servers are running "
         "and which languages were detected in the project."
     )
-    input_schema: ClassVar[dict[str, Any]] = {"type": "object", "properties": {}}
 
     # Attached by make_lsp_tools()
     _lsp_clients: dict[str, LspClient]
@@ -398,7 +522,7 @@ class LspStatusTool(BaseTool):
     _workdir: str
 
     async def run(
-        self, args: dict[str, Any], ctx: InvokeContext | None = None
+        self, args: LspStatusArgs, ctx: InvokeContext | None = None
     ) -> AsyncGenerator[ToolStreamEvent | str, None]:
         status = {
             "workdir": self._workdir,
@@ -408,7 +532,31 @@ class LspStatusTool(BaseTool):
                 for lang, client in sorted(self._lsp_clients.items())
             ],
         }
-        yield json.dumps(status, indent=2, ensure_ascii=False)
+        result = LspStatusResult(status=status)
+        yield result
+
+    @classmethod
+    def format_call_display(cls, args: LspStatusArgs) -> ToolCallDisplay:
+        return ToolCallDisplay(summary="Checking LSP server status")
+
+    @classmethod
+    def get_result_display(cls, event: Any) -> ToolResultDisplay:
+        if not isinstance(event.result, LspStatusResult):
+            return ToolResultDisplay(
+                success=False, message=event.error or event.skip_reason or "No result"
+            )
+
+        running_count = sum(
+            1 for lsp in event.result.status["running_lsp"] if lsp["running"]
+        )
+        return ToolResultDisplay(
+            success=True,
+            message=f"LSP status: {running_count}/{len(event.result.status['running_lsp'])} servers running",
+        )
+
+    @classmethod
+    def get_status_text(cls) -> str:
+        return "Checking LSP server status"
 
     @classmethod
     @functools.cache
