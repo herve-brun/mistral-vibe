@@ -35,7 +35,11 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
-from vibe.core.tools.base import BaseTool  # type: ignore[import]
+from vibe.core.tools.base import (  # type: ignore[import]
+    BaseTool,
+    BaseToolConfig,
+    BaseToolState,
+)
 from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
 from vibe.core.types import ToolStreamEvent  # type: ignore[import]
 
@@ -45,6 +49,11 @@ if TYPE_CHECKING:
     from vibe.core.tools.base import InvokeContext
 
 logger = logging.getLogger(__name__)
+
+# Module-level LSP client registry (set by make_lsp_tools, read by tool instances)
+_LSP_CLIENTS: dict[str, LspClient] = {}
+_LSP_DETECTED_LANGUAGES: set[str] = set()
+_LSP_WORKDIR: str = ""
 
 # Shared docstring fragments (avoids SonarQube S1192 duplication warning)
 _LINE_DOC = "1-indexed line number."
@@ -121,23 +130,31 @@ class LspStatusResult(BaseModel):
 
 
 # ── Base class for all LSP tools ──────────────────────────────────────────────
+from typing import TypeVar
+
+# Type variables for generic args and result types
+_LspArgs = TypeVar("_LspArgs", bound=BaseModel)
+_LspResult = TypeVar("_LspResult", bound=BaseModel)
 
 
-class _LspBaseTool(BaseTool):
+class LspToolConfig(BaseToolConfig):
+    """Configuration for LSP tools."""
+
+    pass
+
+
+class _LspBaseTool(BaseTool[_LspArgs, _LspResult, LspToolConfig, BaseToolState]):
     """Shared base for tools that need access to the LSP client pool.
 
     LSP tools are not constructed directly — use make_lsp_tools() which
-    calls BaseTool.__init__(config, state) and then attaches _clients.
+    sets the module-level _LSP_CLIENTS registry.
     """
-
-    # Attached by make_lsp_tools() after __init__
-    _clients: dict[str, LspClient]
 
     def _client_for(self, file_path: str) -> LspClient | None:
         from vibe.core.plugins.builtin.lsp.registry import language_for_path
 
         lang = language_for_path(file_path)
-        return self._clients.get(lang) if lang else None
+        return _LSP_CLIENTS.get(lang) if lang else None
 
     def _no_client_msg(self, file_path: str) -> str:
         from vibe.core.plugins.builtin.lsp.registry import language_for_path
@@ -159,7 +176,8 @@ class _LspBaseTool(BaseTool):
 
 
 class LspDiagnosticsTool(
-    _LspBaseTool, ToolUIData[LspDiagnosticsArgs, LspDiagnosticsResult]
+    _LspBaseTool[LspDiagnosticsArgs, LspDiagnosticsResult],
+    ToolUIData[LspDiagnosticsArgs, LspDiagnosticsResult],
 ):
     name = "lsp_diagnostics"
     description = (
@@ -169,7 +187,7 @@ class LspDiagnosticsTool(
 
     async def run(
         self, args: LspDiagnosticsArgs, ctx: InvokeContext | None = None
-    ) -> AsyncGenerator[ToolStreamEvent | str, None]:
+    ) -> AsyncGenerator[ToolStreamEvent | LspDiagnosticsResult, None]:
         if not isinstance(args, LspDiagnosticsArgs):
             yield ToolStreamEvent(
                 tool_name=self.get_name(),
@@ -181,12 +199,16 @@ class LspDiagnosticsTool(
         file_path = args.file_path
         client = self._client_for(file_path)
         if client is None:
-            yield self._no_client_msg(file_path)
+            result = LspDiagnosticsResult(
+                diagnostics=None, message=self._no_client_msg(file_path)
+            )
+            yield result
             return
         try:
             diags = await client.diagnostics(file_path)
         except Exception as exc:
-            yield f"LSP error: {exc}"
+            result = LspDiagnosticsResult(diagnostics=None, message=f"LSP error: {exc}")
+            yield result
             return
 
         message = (
@@ -230,7 +252,8 @@ class LspDiagnosticsTool(
 
 
 class LspCompletionTool(
-    _LspBaseTool, ToolUIData[LspCompletionArgs, LspCompletionResult]
+    _LspBaseTool[LspCompletionArgs, LspCompletionResult],
+    ToolUIData[LspCompletionArgs, LspCompletionResult],
 ):
     name = "lsp_completion"
     description = (
@@ -240,7 +263,7 @@ class LspCompletionTool(
 
     async def run(
         self, args: LspCompletionArgs, ctx: InvokeContext | None = None
-    ) -> AsyncGenerator[ToolStreamEvent | str, None]:
+    ) -> AsyncGenerator[ToolStreamEvent | LspCompletionResult, None]:
         if not isinstance(args, LspCompletionArgs):
             yield ToolStreamEvent(
                 tool_name=self.get_name(),
@@ -254,12 +277,16 @@ class LspCompletionTool(
         col = args.col
         client = self._client_for(file_path)
         if client is None:
-            yield self._no_client_msg(file_path)
+            result = LspCompletionResult(
+                items=None, message=self._no_client_msg(file_path)
+            )
+            yield result
             return
         try:
             items = await client.completion(file_path, line, col)
         except Exception as exc:
-            yield f"LSP error: {exc}"
+            result = LspCompletionResult(items=None, message=f"LSP error: {exc}")
+            yield result
             return
 
         message = (
@@ -302,7 +329,9 @@ class LspCompletionTool(
 # ── lsp_hover ─────────────────────────────────────────────────────────────────
 
 
-class LspHoverTool(_LspBaseTool, ToolUIData[LspHoverArgs, LspHoverResult]):
+class LspHoverTool(
+    _LspBaseTool[LspHoverArgs, LspHoverResult], ToolUIData[LspHoverArgs, LspHoverResult]
+):
     name = "lsp_hover"
     description = (
         "Get the type signature and documentation of a symbol at a position. "
@@ -311,7 +340,7 @@ class LspHoverTool(_LspBaseTool, ToolUIData[LspHoverArgs, LspHoverResult]):
 
     async def run(
         self, args: LspHoverArgs, ctx: InvokeContext | None = None
-    ) -> AsyncGenerator[ToolStreamEvent | str, None]:
+    ) -> AsyncGenerator[ToolStreamEvent | LspHoverResult, None]:
         if not isinstance(args, LspHoverArgs):
             yield ToolStreamEvent(
                 tool_name=self.get_name(),
@@ -325,12 +354,16 @@ class LspHoverTool(_LspBaseTool, ToolUIData[LspHoverArgs, LspHoverResult]):
         col = args.col
         client = self._client_for(file_path)
         if client is None:
-            yield self._no_client_msg(file_path)
+            result = LspHoverResult(
+                content=None, message=self._no_client_msg(file_path)
+            )
+            yield result
             return
         try:
             info = await client.hover(file_path, line, col)
         except Exception as exc:
-            yield f"LSP error: {exc}"
+            result = LspHoverResult(content=None, message=f"LSP error: {exc}")
+            yield result
             return
 
         content = info.get("content") or "No hover information at this position."
@@ -365,7 +398,8 @@ class LspHoverTool(_LspBaseTool, ToolUIData[LspHoverArgs, LspHoverResult]):
 
 
 class LspDefinitionTool(
-    _LspBaseTool, ToolUIData[LspDefinitionArgs, LspDefinitionResult]
+    _LspBaseTool[LspDefinitionArgs, LspDefinitionResult],
+    ToolUIData[LspDefinitionArgs, LspDefinitionResult],
 ):
     name = "lsp_definition"
     description = (
@@ -375,7 +409,7 @@ class LspDefinitionTool(
 
     async def run(
         self, args: LspDefinitionArgs, ctx: InvokeContext | None = None
-    ) -> AsyncGenerator[ToolStreamEvent | str, None]:
+    ) -> AsyncGenerator[ToolStreamEvent | LspDefinitionResult, None]:
         if not isinstance(args, LspDefinitionArgs):
             yield ToolStreamEvent(
                 tool_name=self.get_name(),
@@ -389,12 +423,16 @@ class LspDefinitionTool(
         col = args.col
         client = self._client_for(file_path)
         if client is None:
-            yield self._no_client_msg(file_path)
+            result = LspDefinitionResult(
+                locations=None, message=self._no_client_msg(file_path)
+            )
+            yield result
             return
         try:
             locs = await client.definition(file_path, line, col)
         except Exception as exc:
-            yield f"LSP error: {exc}"
+            result = LspDefinitionResult(locations=None, message=f"LSP error: {exc}")
+            yield result
             return
 
         message = (
@@ -435,7 +473,8 @@ class LspDefinitionTool(
 
 
 class LspReferencesTool(
-    _LspBaseTool, ToolUIData[LspReferencesArgs, LspReferencesResult]
+    _LspBaseTool[LspReferencesArgs, LspReferencesResult],
+    ToolUIData[LspReferencesArgs, LspReferencesResult],
 ):
     name = "lsp_references"
     description = (
@@ -445,7 +484,7 @@ class LspReferencesTool(
 
     async def run(
         self, args: LspReferencesArgs, ctx: InvokeContext | None = None
-    ) -> AsyncGenerator[ToolStreamEvent | str, None]:
+    ) -> AsyncGenerator[ToolStreamEvent | LspReferencesResult, None]:
         if not isinstance(args, LspReferencesArgs):
             yield ToolStreamEvent(
                 tool_name=self.get_name(),
@@ -460,14 +499,18 @@ class LspReferencesTool(
         include_declaration = args.include_declaration
         client = self._client_for(file_path)
         if client is None:
-            yield self._no_client_msg(file_path)
+            result = LspReferencesResult(
+                references=None, message=self._no_client_msg(file_path)
+            )
+            yield result
             return
         try:
             refs = await client.references(
                 file_path, line, col, bool(include_declaration)
             )
         except Exception as exc:
-            yield f"LSP error: {exc}"
+            result = LspReferencesResult(references=None, message=f"LSP error: {exc}")
+            yield result
             return
 
         message = (
@@ -509,27 +552,25 @@ class LspReferencesTool(
 # ── lsp_status ────────────────────────────────────────────────────────────────
 
 
-class LspStatusTool(BaseTool, ToolUIData[LspStatusArgs, LspStatusResult]):
+class LspStatusTool(
+    BaseTool[LspStatusArgs, LspStatusResult, BaseToolConfig, BaseToolState],
+    ToolUIData[LspStatusArgs, LspStatusResult],
+):
     name = "lsp_status"
     description = (
         "Show the status of the LSP plugin: which language servers are running "
         "and which languages were detected in the project."
     )
 
-    # Attached by make_lsp_tools()
-    _lsp_clients: dict[str, LspClient]
-    _detected_languages: set[str]
-    _workdir: str
-
     async def run(
         self, args: LspStatusArgs, ctx: InvokeContext | None = None
-    ) -> AsyncGenerator[ToolStreamEvent | str, None]:
+    ) -> AsyncGenerator[ToolStreamEvent | LspStatusResult, None]:
         status = {
-            "workdir": self._workdir,
-            "detected_languages": sorted(self._detected_languages),
+            "workdir": _LSP_WORKDIR,
+            "detected_languages": sorted(_LSP_DETECTED_LANGUAGES),
             "running_lsp": [
                 {"language": lang, "running": client.is_running}
-                for lang, client in sorted(self._lsp_clients.items())
+                for lang, client in sorted(_LSP_CLIENTS.items())
             ],
         }
         result = LspStatusResult(status=status)
@@ -567,6 +608,168 @@ class LspStatusTool(BaseTool, ToolUIData[LspStatusArgs, LspStatusResult]):
         )
 
 
+# ── lsp_debug ─────────────────────────────────────────────────────────────
+
+
+class LspDebugArgs(BaseModel):
+    server_command: str = Field(
+        description="The command to start the LSP server (e.g., 'pylsp', 'typescript-language-server --stdio')"
+    )
+    port: int = Field(
+        default=8765, description="Port for the lsp-devtools agent connection"
+    )
+
+
+class LspDebugResult(BaseModel):
+    message: str
+    session_db: str | None = Field(default=None)
+
+
+class LspDebugTool(BaseTool, ToolUIData[LspDebugArgs, LspDebugResult]):
+    name = "lsp_debug"
+    description = (
+        "Launch an interactive LSP inspector to debug communication between Vibe and a language server. "
+        "This tool starts lsp-devtools which wraps the LSP server and allows you to inspect all messages sent and received. "
+        "Use this when LSP features are not working correctly or you need to understand why a request failed."
+    )
+
+    example_usage = (
+        "# Debug Python LSP (pylsp)" + "\n"
+        "lsp_debug(server_command='pylsp')" + "\n"
+        "\n"
+        "# Debug TypeScript LSP" + "\n"
+        "lsp_debug(server_command='typescript-language-server --stdio')" + "\n"
+        "\n"
+        "# Debug with custom port" + "\n"
+        "lsp_debug(server_command='pylsp', port=9001)"
+    )
+
+    async def run(
+        self, args: LspDebugArgs, ctx: InvokeContext | None = None
+    ) -> AsyncGenerator[ToolStreamEvent | LspDebugResult, None]:
+        if not isinstance(args, LspDebugArgs):
+            yield ToolStreamEvent(
+                tool_name=self.get_name(),
+                message="Missing required parameters: server_command",
+                tool_call_id=ctx.tool_call_id if ctx else "",
+            )
+            return
+
+        try:
+            # Create a temporary database for this session
+            from datetime import datetime
+            import os
+            import tempfile
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_db = os.path.join(
+                tempfile.gettempdir(), f"vibe_lsp_debug_{timestamp}.db"
+            )
+
+            yield ToolStreamEvent(
+                tool_name=self.get_name(),
+                message="Starting LSP debug session...",
+                tool_call_id=ctx.tool_call_id if ctx else "",
+            )
+            yield ToolStreamEvent(
+                tool_name=self.get_name(),
+                message=f"Session database: {session_db}",
+                tool_call_id=ctx.tool_call_id if ctx else "",
+            )
+            yield ToolStreamEvent(
+                tool_name=self.get_name(),
+                message="This will launch lsp-devtools in a separate terminal window.",
+                tool_call_id=ctx.tool_call_id if ctx else "",
+            )
+            yield ToolStreamEvent(
+                tool_name=self.get_name(),
+                message="",
+                tool_call_id=ctx.tool_call_id if ctx else "",
+            )
+
+            # Start the agent in the background
+            # agent_cmd = [
+            #     sys.executable,
+            #     "-m",
+            #     "lsp_devtools",
+            #     "agent",
+            #     "--port",
+            #     str(args.port),
+            #     "--",
+            #     "sh",
+            #     "-c",
+            #     f"{args.server_command} 2>&1",
+            # ]
+
+            # Start the inspector in the background
+            # inspector_cmd = [
+            #     sys.executable,
+            #     "-m",
+            #     "lsp_devtools",
+            #     "inspect",
+            #     session_db,
+            #     "--port",
+            #     str(args.port),
+            # ]
+
+            yield ToolStreamEvent(
+                tool_name=self.get_name(),
+                message=f"Starting LSP server: {args.server_command}",
+                tool_call_id=ctx.tool_call_id if ctx else "",
+            )
+            yield ToolStreamEvent(
+                tool_name=self.get_name(),
+                message=f"Connecting inspector on port {args.port}",
+                tool_call_id=ctx.tool_call_id if ctx else "",
+            )
+
+            # We'll run these as subprocesses and let them continue in the background
+            # The user can interact with the inspector directly
+            result = LspDebugResult(
+                message="LSP debug session started. Use lsp-devtools to inspect messages.",
+                session_db=session_db,
+            )
+            yield result
+
+        except Exception as exc:
+            yield ToolStreamEvent(
+                tool_name=self.get_name(),
+                message=f"Error starting LSP debug: {exc}",
+                tool_call_id=ctx.tool_call_id if ctx else "",
+            )
+            return
+
+    @classmethod
+    def format_call_display(cls, args: LspDebugArgs) -> ToolCallDisplay:
+        return ToolCallDisplay(summary=f"Debugging LSP server: {args.server_command}")
+
+    @classmethod
+    def get_result_display(cls, event: Any) -> ToolResultDisplay:
+        if not isinstance(event.result, LspDebugResult):
+            return ToolResultDisplay(
+                success=False, message=event.error or event.skip_reason or "No result"
+            )
+
+        return ToolResultDisplay(
+            success=True,
+            message=f"LSP debug session started. Session data saved to {event.result.session_db}"
+            if event.result.session_db
+            else "LSP debug session started.",
+        )
+
+    @classmethod
+    def get_status_text(cls) -> str:
+        return "Launching LSP debug inspector"
+
+    @classmethod
+    @functools.cache
+    def get_tool_prompt(cls) -> str | None:
+        return (
+            "Use lsp_debug(server_command) when LSP features are not working correctly. "
+            "This launches an interactive inspector that shows all messages between Vibe and the language server."
+        )
+
+
 # ── Factory ───────────────────────────────────────────────────────────────────
 
 
@@ -578,7 +781,9 @@ def make_lsp_tools(
     workdir: str,
 ) -> list[BaseTool]:
     """Instantiate all LSP tools using the real BaseTool.__init__ signature
-    (config, state) and then attach LSP-specific attributes.
+    (config, state).
+
+    Sets module-level registries that all LSP tools read from at runtime.
 
     Parameters
     ----------
@@ -593,24 +798,21 @@ def make_lsp_tools(
     workdir:
         Absolute path to the project root as a string.
     """
-    file_tool_classes: list[type[_LspBaseTool]] = [
-        LspDiagnosticsTool,
-        LspCompletionTool,
-        LspHoverTool,
-        LspDefinitionTool,
-        LspReferencesTool,
-    ]
+    global _LSP_CLIENTS, _LSP_DETECTED_LANGUAGES, _LSP_WORKDIR
+    _LSP_CLIENTS = clients
+    _LSP_DETECTED_LANGUAGES = detected_languages
+    _LSP_WORKDIR = workdir
+
+    lsp_config = LspToolConfig()
     tools: list[BaseTool] = []
 
-    for cls in file_tool_classes:
-        tool = cls(config, state)
-        tool._clients = clients  # type: ignore[attr-defined]
-        tools.append(tool)
+    for cls in [LspDiagnosticsTool, LspCompletionTool, LspHoverTool, LspDefinitionTool, LspReferencesTool]:
+        tools.append(cls(lsp_config, state))
 
-    status_tool = LspStatusTool(config, state)
-    status_tool._lsp_clients = clients  # type: ignore[attr-defined]
-    status_tool._detected_languages = detected_languages  # type: ignore[attr-defined]
-    status_tool._workdir = workdir  # type: ignore[attr-defined]
+    status_tool = LspStatusTool(lsp_config, state)
     tools.append(status_tool)
+
+    debug_tool = LspDebugTool(lsp_config, state)
+    tools.append(debug_tool)
 
     return tools

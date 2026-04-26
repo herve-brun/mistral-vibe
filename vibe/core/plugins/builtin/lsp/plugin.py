@@ -84,6 +84,8 @@ class LspPlugin(ToolEventPlugin):
                 "lsp_references",
                 "lsp_status",
             ],
+            priority=50,
+            tags=["lsp", "language-server", "diagnostics"],
         )
 
     def __init__(self) -> None:
@@ -98,6 +100,7 @@ class LspPlugin(ToolEventPlugin):
     async def setup(self, context: PluginContext) -> None:
         self._context = context
         workdir = context.workdir
+        logger.info("LSP plugin setup() called with workdir=%s, tool_manager=%s", workdir, context.tool_manager)
 
         # 1. Detect languages present in the project
         self._detected_languages = detect_languages_in_dir(str(workdir))
@@ -166,9 +169,9 @@ class LspPlugin(ToolEventPlugin):
             │ ⚠ WARNING line 20 col 1  — Unused import 'os'   [pylsp]     │
             └─ 1 error, 1 warning ────────────────────────────────────────┘
         """
-        if tool_name not in _WRITE_TOOLS:
-            self._pending_diag_files.clear()
-            return
+        # if tool_name not in _WRITE_TOOLS:
+        #     self._pending_diag_files.clear()
+        #     return
 
         all_diag_lines: list[str] = []
 
@@ -217,8 +220,7 @@ class LspPlugin(ToolEventPlugin):
             return
         client = LspClient(cfg, workdir)
         try:
-            # Start client in background to avoid blocking TUI initialization
-            asyncio.create_task(client.start())
+            await client.start()
             self._clients[lang] = client
         except LspClientError as exc:
             logger.warning("LSP start failed for '%s': %s", lang, exc)
@@ -241,30 +243,27 @@ class LspPlugin(ToolEventPlugin):
 
     def _register_tools(self, context: PluginContext) -> None:
         """Inject LSP tools into Vibe's ToolManager."""
-        try:
-            from vibe.core.tools.manager import ToolManager  # type: ignore[import]
-
-            tm = ToolManager(lambda: context.config)
-
-            # BaseTool.__init__(config, state) — retrieve both from the manager
-            # so we pass the exact same objects Vibe uses for all built-in tools.
-            vibe_config = tm._config  # Access private _config property
-            # For LSP tools, we use a simple empty object as state since LSP tools
-            # don't need persistent state management through ToolManager
-            from dataclasses import dataclass
-
-            @dataclass
-            class EmptyState:
-                pass
-
-            vibe_state = EmptyState()
-        except Exception as exc:
+        # Get the tool manager from context (provided by AgentLoop)
+        tm = context.tool_manager
+        if tm is None:
             logger.warning(
-                "LSP plugin could not access ToolManager (config/state): %s. "
-                "Tools will not be registered.",
-                exc,
+                "LSP plugin: no ToolManager available in PluginContext. "
+                "Tools will not be registered."
             )
             return
+
+        # BaseTool.__init__(config, state) — retrieve both from the manager
+        # so we pass the exact same objects Vibe uses for all built-in tools.
+        vibe_config = tm._config  # Access private _config property
+        # For LSP tools, we use a simple empty object as state since LSP tools
+        # don't need persistent state management through ToolManager
+        from dataclasses import dataclass
+
+        @dataclass
+        class EmptyState:
+            pass
+
+        vibe_state = EmptyState()
 
         tools = make_lsp_tools(
             config=vibe_config,
@@ -275,7 +274,7 @@ class LspPlugin(ToolEventPlugin):
         )
         try:
             for tool in tools:
-                tm.register_dynamic_tool(type(tool))
+                tm.register_dynamic_tool_instance(tool)
             logger.debug("LSP plugin: registered %d tools into ToolManager", len(tools))
         except Exception as exc:
             logger.warning(
