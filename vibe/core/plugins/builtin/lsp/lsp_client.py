@@ -26,6 +26,9 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from lsp_client import clients
+from lsp_client.capability.server_notification import WithReceivePublishDiagnostics
+from lsp_client.clients.pyright import PyrightClient as BasePyrightClient
 from vibe.core.plugins.builtin.lsp.registry import LspConfig
 
 logger = logging.getLogger(__name__)
@@ -33,10 +36,34 @@ logger = logging.getLogger(__name__)
 # Seconds to wait for server to respond to requests.
 _REQUEST_TIMEOUT = 10.0
 
+
+class PyrightClientWithDiagnostics(BasePyrightClient, WithReceivePublishDiagnostics):
+    """PyrightClient that captures diagnostics pushed by the server."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._diagnostics: dict[str, list[Any]] = {}  # uri -> diagnostics
+
+    async def _receive_publish_diagnostics(
+        self, params: Any
+    ) -> None:
+        uri = params.uri
+        diagnostics = list(params.diagnostics)
+        self._diagnostics[uri] = diagnostics
+        logger.debug("Stored %d diagnostics for %s", len(diagnostics), uri)
+
+    async def receive_publish_diagnostics(self, noti: Any) -> None:
+        return await self._receive_publish_diagnostics(noti.params)
+
+    def get_diagnostics_for_uri(self, uri: str) -> list[Any]:
+        """Get stored diagnostics for a URI."""
+        return self._diagnostics.get(uri, [])
+
+
 # Map language to lsp-client client class
 # Note: "Client" refers to the base Client class for generic LSP servers
 _LSP_CLIENTS: dict[str, str] = {
-    "python": "PyrightClient",  # Use PyrightClient for Python
+    "python": "PyrightClientWithDiagnostics",  # Use custom PyrightClient for Python
     "typescript": "TypescriptClient",
     "rust": "RustAnalyzerClient",
     "go": "GoplsClient",
@@ -92,7 +119,11 @@ class LspClient:
             )
 
         try:
-            self._client_class = getattr(clients, client_class_name)
+            # Check if it's our custom class defined in this module
+            if client_class_name == "PyrightClientWithDiagnostics":
+                self._client_class = PyrightClientWithDiagnostics
+            else:
+                self._client_class = getattr(clients, client_class_name)
         except AttributeError as exc:
             raise LspClientError(
                 f"Client class not found: {client_class_name}"
@@ -137,18 +168,37 @@ class LspClient:
         self._assert_started()
 
         try:
-            result = await self._client.request_text_document_diagnostics(
-                file_path=file_path,
-            )
+            # Convert file path to URI for lookup
+            uri = self._client.as_uri(file_path)
+
+            # For PyrightClientWithDiagnostics, get stored diagnostics
+            if hasattr(self._client, 'get_diagnostics_for_uri'):
+                # Get stored diagnostics (push model)
+                diags = self._client.get_diagnostics_for_uri(uri)
+                if not diags:
+                    # Try opening the file to trigger diagnostics
+                    async for _ in self._client.open_files(file_path):
+                        # Wait a bit for diagnostics to arrive
+                        await asyncio.sleep(0.5)
+                        diags = self._client.get_diagnostics_for_uri(uri)
+                        break
+            else:
+                # Fallback for other clients that might support pull diagnostics
+                if hasattr(self._client, 'request_diagnostics'):
+                    result = await self._client.request_diagnostics(file_path=file_path)
+                    diags = result if result else []
+                else:
+                    diags = []
+
         except Exception as e:
             logger.warning("diagnostics error: %s", e)
             return []
 
-        if not result:
+        if not diags:
             return []
 
         return [
-            self._format_diagnostic(d) for d in result
+            self._format_diagnostic(d) for d in diags
         ]
 
     async def completion(

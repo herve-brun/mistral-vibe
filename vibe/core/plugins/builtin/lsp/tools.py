@@ -1658,7 +1658,10 @@ class LspDebugResult(BaseModel):
     session_db: str | None = Field(default=None)
 
 
-class LspDebugTool(BaseTool, ToolUIData[LspDebugArgs, LspDebugResult]):
+class LspDebugTool(
+    _LspBaseTool[LspDebugArgs, LspDebugResult],
+    ToolUIData[LspDebugArgs, LspDebugResult],
+):
     name = "lsp_debug"
     description = (
         "Launch an interactive LSP inspector to debug communication between Vibe and a language server. "

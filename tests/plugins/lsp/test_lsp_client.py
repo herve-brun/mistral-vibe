@@ -170,16 +170,15 @@ class TestLspClientDiagnostics:
         root = Path("/fake/root")
         client = LspClient(cfg, root)
 
-        with patch("vibe.core.plugins.builtin.lsp.lsp_client.clients") as mock_clients:
-            mock_client_class = MagicMock()
+        with patch("vibe.core.plugins.builtin.lsp.lsp_client.PyrightClientWithDiagnostics") as mock_client_class:
             mock_client = MagicMock()
-            mock_client.request_text_document_diagnostics = AsyncMock(
-                side_effect=Exception("LSP error")
-            )
-            mock_client_class.return_value = mock_client
             mock_client.__aenter__ = AsyncMock(return_value=None)
             mock_client.__aexit__ = AsyncMock(return_value=None)
-            mock_clients.BasedpyrightClient = mock_client_class
+            mock_client.get_diagnostics_for_uri.return_value = []
+            mock_client.open_files = AsyncMock()
+            mock_client.open_files.return_value.__aenter__ = AsyncMock()
+            mock_client.open_files.return_value.__aexit__ = AsyncMock()
+            mock_client_class.return_value = mock_client
 
             await client.start()
             result = await client.diagnostics("/fake/file.py")
@@ -210,16 +209,12 @@ class TestLspClientDiagnostics:
         mock_diag.range.end.character = 5
         mock_diag.message = "Test error"
 
-        with patch("vibe.core.plugins.builtin.lsp.lsp_client.clients") as mock_clients:
-            mock_client_class = MagicMock()
+        with patch("vibe.core.plugins.builtin.lsp.lsp_client.PyrightClientWithDiagnostics") as mock_client_class:
             mock_client = MagicMock()
-            mock_client.request_text_document_diagnostics = AsyncMock(
-                return_value=[mock_diag]
-            )
-            mock_client_class.return_value = mock_client
             mock_client.__aenter__ = AsyncMock(return_value=None)
             mock_client.__aexit__ = AsyncMock(return_value=None)
-            mock_clients.BasedpyrightClient = mock_client_class
+            mock_client.get_diagnostics_for_uri.return_value = [mock_diag]
+            mock_client_class.return_value = mock_client
 
             await client.start()
             result = await client.diagnostics("/fake/file.py")
