@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any
 
 from vibe.core.plugins.base import PluginContext, PluginMetadata, ToolEventPlugin
 from vibe.core.plugins.builtin.lsp.lsp_client import LspClient, LspClientError
+from vibe.core.plugins.builtin.lsp.logging import setup_lsp_logging
 from vibe.core.plugins.builtin.lsp.registry import (
     LSP_REGISTRY,
     detect_languages_in_dir,
@@ -101,6 +102,8 @@ class LspPlugin(ToolEventPlugin):
         self._context = context
         workdir = context.workdir
         logger.info("LSP plugin setup() called with workdir=%s, tool_manager=%s", workdir, context.tool_manager)
+
+        setup_lsp_logging()
 
         # 1. Detect languages present in the project
         self._detected_languages = detect_languages_in_dir(str(workdir))

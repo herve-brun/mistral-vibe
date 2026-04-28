@@ -177,11 +177,10 @@ class LspClient:
                 diags = self._client.get_diagnostics_for_uri(uri)
                 if not diags:
                     # Try opening the file to trigger diagnostics
-                    async for _ in self._client.open_files(file_path):
+                    async with self._client.open_files(file_path):
                         # Wait a bit for diagnostics to arrive
                         await asyncio.sleep(0.5)
                         diags = self._client.get_diagnostics_for_uri(uri)
-                        break
             else:
                 # Fallback for other clients that might support pull diagnostics
                 if hasattr(self._client, 'request_diagnostics'):
@@ -690,7 +689,12 @@ class LspClient:
         docs = getattr(r, "documentChanges", r.get("documentChanges", []) if isinstance(r, dict) else [])
         for doc in (docs or []):
             uri = getattr(doc, "uri", doc.get("uri", "") if isinstance(doc, dict) else "")
-            file_path = uri.replace("file://", "") if uri.startswith("file://") else uri
+            # Handle file:// URI and normalize to proper path
+            if uri.startswith("file://"):
+                from lsp_client.utils.uri import from_local_uri
+                file_path = str(from_local_uri(uri))
+            else:
+                file_path = uri
             edits = getattr(doc, "edits", doc.get("edits", []) if isinstance(doc, dict) else [])
             if file_path:
                 if file_path not in changes:
