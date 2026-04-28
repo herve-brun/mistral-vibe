@@ -790,11 +790,10 @@ class VibeApp(App):  # noqa: PLR0904
                 handler = getattr(self, command.handler)
 
             # Execute the handler and capture its return value
-            result = None
             if asyncio.iscoroutinefunction(handler):
-                await handler(cmd_args=cmd_args)
+                result = await handler(cmd_args=cmd_args)
             else:
-                handler(cmd_args=cmd_args)
+                result = handler(cmd_args=cmd_args)
 
             # If the handler returned a string, display it in the chat
             if result is not None and isinstance(result, str):
@@ -1420,7 +1419,7 @@ class VibeApp(App):  # noqa: PLR0904
             return
         await self._switch_to_config_app()
 
-    async def _show_plugins_status(self) -> None:
+    async def _show_plugins_status(self, **kwargs: Any) -> None:
         """Display the status of all active plugins."""
         summary = self.agent_loop.plugin_manager.summary()
         plugins_text = f"## Plugins Status\n\n{summary}"
