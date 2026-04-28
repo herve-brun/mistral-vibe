@@ -7,8 +7,10 @@ This plugin adds two new commands:
 
 from __future__ import annotations
 
+from typing import Any
+
 from vibe.cli.commands import Command, CommandRegistry
-from vibe.core.plugins.base import PluginMetadata, VibePlugin
+from vibe.core.plugins.base import PluginContext, PluginMetadata, VibePlugin
 from vibe.core.plugins.command_plugin import CommandPlugin
 
 
@@ -24,6 +26,14 @@ class ExampleCommandPlugin(VibePlugin, CommandPlugin):
             priority=100,
             tags=["demo", "example"],
         )
+
+    async def setup(self, context: PluginContext) -> None:
+        """Setup the plugin. Required by VibePlugin interface."""
+        pass
+
+    async def teardown(self) -> None:
+        """Teardown the plugin. Required by VibePlugin interface."""
+        pass
 
     async def register_commands(self, registry: CommandRegistry) -> None:
         """Register our custom commands."""
@@ -47,11 +57,11 @@ class ExampleCommandPlugin(VibePlugin, CommandPlugin):
             ),
         )
 
-    async def _show_greeting(self) -> str:
+    async def _show_greeting(self, **kwargs: Any) -> str:
         """Handler for /greet command."""
-        return "Hello there! 👋 How can I help you today?"
+        return "Hello there! How can I help you today?"
 
-    async def _show_time(self) -> str:
+    async def _show_time(self, **kwargs: Any) -> str:
         """Handler for /time command."""
         from datetime import datetime
 
