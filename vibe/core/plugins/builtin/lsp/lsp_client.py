@@ -26,27 +26,111 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import shutil
+from functools import partial
+from subprocess import CalledProcessError
+
 from lsp_client import clients
-from lsp_client.capability.server_notification import WithReceivePublishDiagnostics
-from lsp_client.clients.pyright import PyrightClient as BasePyrightClient
+from lsp_client.capability.notification import (
+    WithNotifyDidChangeConfiguration,
+    WithNotifyDidCreateFiles,
+    WithNotifyDidDeleteFiles,
+    WithNotifyDidRenameFiles,
+)
+from lsp_client.capability.request import (
+    WithRequestCallHierarchy,
+    WithRequestCodeAction,
+    WithRequestCompletion,
+    WithRequestDeclaration,
+    WithRequestDefinition,
+    WithRequestDocumentSymbol,
+    WithRequestHover,
+    WithRequestReferences,
+    WithRequestRename,
+    WithRequestSignatureHelp,
+    WithRequestTypeDefinition,
+    WithRequestWillCreateFiles,
+    WithRequestWillDeleteFiles,
+    WithRequestWillRenameFiles,
+    WithRequestWorkspaceSymbol,
+)
+from lsp_client.capability.server_notification import (
+    WithReceiveLogMessage,
+    WithReceiveLogTrace,
+    WithReceivePublishDiagnostics,
+    WithReceiveShowMessage,
+)
+from lsp_client.capability.server_request import (
+    WithRespondConfigurationRequest,
+    WithRespondInlayHintRefresh,
+    WithRespondShowDocumentRequest,
+    WithRespondShowMessageRequest,
+    WithRespondWorkspaceFoldersRequest,
+)
+from lsp_client.clients.base import PythonClientBase
+from lsp_client.server import LocalServer, ServerInstallationError
 from vibe.core.plugins.builtin.lsp.registry import LspConfig
 
 logger = logging.getLogger(__name__)
 
-# Seconds to wait for server to respond to requests.
 _REQUEST_TIMEOUT = 10.0
 
 
-class PyrightClientWithDiagnostics(BasePyrightClient, WithReceivePublishDiagnostics):
-    """PyrightClient that captures diagnostics pushed by the server."""
+async def ensure_pyrefly_installed() -> None:
+    if shutil.which("pyrefly"):
+        return
+    raise ServerInstallationError(
+        "pyrefly not found. Please install it with: pip install pyrefly. "
+        "See https://pyrefly.org/ for more information."
+    )
+
+
+PyreflyLocalServer = partial(
+    LocalServer,
+    program="pyrefly",
+    args=["lsp", "--verbose", "--indexing-mode", "lazy-blocking"],
+    ensure_installed=ensure_pyrefly_installed,
+)
+
+
+class PyreflyClient(
+    PythonClientBase,
+    WithReceivePublishDiagnostics,
+    WithNotifyDidChangeConfiguration,
+    WithNotifyDidCreateFiles,
+    WithNotifyDidDeleteFiles,
+    WithNotifyDidRenameFiles,
+    WithRequestCallHierarchy,
+    WithRequestCodeAction,
+    WithRequestCompletion,
+    WithRequestDeclaration,
+    WithRequestDefinition,
+    WithRequestDocumentSymbol,
+    WithRequestHover,
+    WithRequestReferences,
+    WithRequestRename,
+    WithRequestSignatureHelp,
+    WithRequestTypeDefinition,
+    WithRequestWillCreateFiles,
+    WithRequestWillRenameFiles,
+    WithRequestWillDeleteFiles,
+    WithRequestWorkspaceSymbol,
+    WithReceiveLogMessage,
+    WithReceiveLogTrace,
+    WithReceiveShowMessage,
+    WithRespondConfigurationRequest,
+    WithRespondInlayHintRefresh,
+    WithRespondShowDocumentRequest,
+    WithRespondShowMessageRequest,
+    WithRespondWorkspaceFoldersRequest,
+):
+    """Pyrefly client for LSP with diagnostics support."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self._diagnostics: dict[str, list[Any]] = {}  # uri -> diagnostics
+        self._diagnostics: dict[str, list[Any]] = {}
 
-    async def _receive_publish_diagnostics(
-        self, params: Any
-    ) -> None:
+    async def _receive_publish_diagnostics(self, params: Any) -> None:
         uri = params.uri
         diagnostics = list(params.diagnostics)
         self._diagnostics[uri] = diagnostics
@@ -56,14 +140,18 @@ class PyrightClientWithDiagnostics(BasePyrightClient, WithReceivePublishDiagnost
         return await self._receive_publish_diagnostics(noti.params)
 
     def get_diagnostics_for_uri(self, uri: str) -> list[Any]:
-        """Get stored diagnostics for a URI."""
         return self._diagnostics.get(uri, [])
 
+    @classmethod
+    def create_default_servers(cls) -> clients.DefaultServers:
+        return clients.DefaultServers(
+            local=PyreflyLocalServer(),
+            container=clients.PyrightClient.container,  # type: ignore[attr-defined]
+        )
 
-# Map language to lsp-client client class
-# Note: "Client" refers to the base Client class for generic LSP servers
+
 _LSP_CLIENTS: dict[str, str] = {
-    "python": "PyrightClientWithDiagnostics",  # Use custom PyrightClient for Python
+    "python": "PyreflyClient",
     "typescript": "TypescriptClient",
     "rust": "RustAnalyzerClient",
     "go": "GoplsClient",

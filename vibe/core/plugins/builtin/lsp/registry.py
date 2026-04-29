@@ -49,17 +49,18 @@ class LspConfig:
 # ── Built-in registry ─────────────────────────────────────────────────────────
 
 LSP_REGISTRY: dict[str, LspConfig] = {
-    # Python LSP server using pyright (faster, more modern)
+    # Python LSP server using pyrefly (fast, modern)
     "python": LspConfig(
         language="python",
         extensions=frozenset({".py", ".pyi"}),
-        command=["pyright-langserver", "--stdio"],
+        command=["pyrefly", "lsp"],
         language_id="python",
         root_markers=frozenset({
             "pyproject.toml",
             "setup.py",
             "setup.cfg",
             "requirements.txt",
+            "pyrefly.toml",
         }),
     ),
     "typescript": LspConfig(
