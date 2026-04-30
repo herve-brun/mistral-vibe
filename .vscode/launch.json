@@ -55,7 +55,9 @@
       "env": {
         "DEBUG_MODE": "true"
       },
-      "args": [],
+      "args": [
+        "--workdir=d:/dev/projets/angular-with-ai-config/"
+      ],
       "console": "integratedTerminal",
       "justMyCode": false
     },

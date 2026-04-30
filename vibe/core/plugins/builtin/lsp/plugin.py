@@ -32,8 +32,12 @@ from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Any
 
+import pluggy
+
 from vibe.core.plugins.base import PluginContext, PluginMetadata, ToolEventPlugin
 from vibe.core.plugins.builtin.lsp.lsp_client import LspClient, LspClientError
+
+hookimpl = pluggy.HookimplMarker("mistral-vibe")
 from vibe.core.plugins.builtin.lsp.logging import setup_lsp_logging
 from vibe.core.plugins.builtin.lsp.registry import (
     LSP_REGISTRY,
@@ -134,8 +138,9 @@ class LspPlugin(ToolEventPlugin):
         langs = detect_languages_in_dir(str(context.workdir), max_files=1000)
         return bool(langs)
 
-    # ── ToolEventPlugin hooks ─────────────────────────────────────────────────
+    # ── ToolEventPlugin hooks (using pluggy) ───────────────────────────────
 
+    @hookimpl
     async def on_tool_call(
         self, tool_name: str, arguments: dict[str, Any], context: PluginContext
     ) -> None:
@@ -144,12 +149,16 @@ class LspPlugin(ToolEventPlugin):
         • For file-access tools: starts the LSP on demand if needed.
         • Records write targets for post-result diagnostics.
         """
+        logger.debug("on_tool_call: tool_name=%s, arguments=%s", tool_name, arguments)
         file_path = self._extract_path(tool_name, arguments)
         if file_path:
+            logger.debug("on_tool_call: detected file_path=%s", file_path)
             await self._ensure_client_for_file(file_path, context.workdir)
             if tool_name in _WRITE_TOOLS:
                 self._pending_diag_files.append(file_path)
+                logger.debug("on_tool_call: added %s to pending diagnostics", file_path)
 
+    @hookimpl
     async def on_tool_result(
         self,
         tool_name: str,
@@ -172,6 +181,7 @@ class LspPlugin(ToolEventPlugin):
             │ ⚠ WARNING line 20 col 1  — Unused import 'os'   [pylsp]     │
             └─ 1 error, 1 warning ────────────────────────────────────────┘
         """
+        logger.debug("on_tool_result: tool_name=%s, pending_files=%s", tool_name, self._pending_diag_files)
         # if tool_name not in _WRITE_TOOLS:
         #     self._pending_diag_files.clear()
         #     return
@@ -181,17 +191,20 @@ class LspPlugin(ToolEventPlugin):
         for file_path in self._pending_diag_files:
             client = self._client_for_file(file_path)
             if client is None:
+                logger.debug("on_tool_result: no LSP client for %s", file_path)
                 continue
             try:
                 # Ensure the client is actually started before calling diagnostics
                 if not client.is_running:
                     await client.start()
                 diags = await client.diagnostics(file_path)
+                logger.debug("on_tool_result: got %d diagnostics for %s", len(diags) if diags else 0, file_path)
             except Exception as exc:
                 logger.debug("Auto-diagnostics failed for %s: %s", file_path, exc)
                 continue
 
             if not diags:
+                logger.debug("on_tool_result: no diagnostics for %s", file_path)
                 continue
 
             all_diag_lines.append(_format_diagnostics_block(file_path, diags))
@@ -206,6 +219,8 @@ class LspPlugin(ToolEventPlugin):
             logger.debug(
                 "LSP diagnostics output prepared for %d file(s)", len(all_diag_lines)
             )
+        else:
+            logger.debug("on_tool_result: no diagnostics to report")
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 

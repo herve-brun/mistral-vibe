@@ -28,8 +28,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import shutil
 
-from vibe.core.paths._vibe_home import LOG_DIR, GlobalPath
-
 
 @dataclass
 class LspConfig:
@@ -67,8 +65,12 @@ LSP_REGISTRY: dict[str, LspConfig] = {
         language="typescript",
         extensions=frozenset({".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}),
         command=[
+            "npx",
+            "-y",
             "typescript-language-server",
             "--stdio",
+            "--log-level",
+            "4",
         ],
         language_id="typescript",
         root_markers=frozenset({"package.json", "tsconfig.json", "jsconfig.json"}),
