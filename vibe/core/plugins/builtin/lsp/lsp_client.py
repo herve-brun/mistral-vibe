@@ -238,11 +238,59 @@ class LspClient:
         logger.info("LSP started: %s (%s)", self._cfg.language, self._cfg.command[0])
 
     async def stop(self) -> None:
-        """Send shutdown/exit to the server and clean up."""
+        """Send shutdown/exit to the server and clean up.
+
+        If the subprocess was already killed (e.g. by the user or OS), the
+        ``lsp_client`` library's ``__aexit__`` will hang waiting for a response
+        that never arrives and then corrupt async-generator / anyio task-group
+        state on cleanup.  We protect against that by:
+
+        1. Detecting a dead subprocess and skipping ``__aexit__`` entirely.
+        2. Capping the shutdown wait time as a fallback.
+        3. Catching RuntimeError from anyio / async-generator corruption.
+        """
         if not self._started or self._client is None:
             return
+
+        # If the library exposes a process handle, check whether it's still alive.
+        # The lsp_client library stores the subprocess as _server._process (an
+        # anyio Process, not subprocess.Popen).
+        proc_alive: bool | None = None
         try:
-            await self._client.__aexit__(None, None, None)
+            server = getattr(self._client, "_server", None)
+            if server is not None:
+                proc = getattr(server, "_process", None)
+                if proc is not None:
+                    # anyio Process: returncode is None while running
+                    proc_alive = proc.returncode is None
+        except Exception:
+            pass
+
+        if proc_alive is False:
+            # Process is confirmed dead — skip graceful shutdown; it will
+            # never respond and __aexit__ will corrupt anyio state.
+            logger.debug(
+                "LSP subprocess already dead (returncode set), "
+                "skipping shutdown (%s)",
+                self._cfg.language,
+            )
+            self._started = False
+            self._client = None
+            return
+
+        try:
+            await asyncio.wait_for(
+                self._client.__aexit__(None, None, None),
+                timeout=5.0,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.debug(
+                "LSP graceful shutdown timed out for %s, forcing cleanup",
+                self._cfg.language,
+            )
+        except RuntimeError as exc:
+            # anyio task-group / async-generator corruption (e.g. killed subprocess)
+            logger.debug("LSP stop RuntimeError (%s): %s", self._cfg.language, exc)
         except Exception as exc:
             logger.debug("LSP stop error (%s): %s", self._cfg.language, exc)
         finally:
