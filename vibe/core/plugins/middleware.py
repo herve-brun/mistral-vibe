@@ -33,6 +33,7 @@ Wiring example (done once in vibe/core/agent_loop.py or startup code)
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 from typing import TYPE_CHECKING, Any
@@ -166,49 +167,58 @@ class PluginMiddleware:
         self._patched_loop = loop
         logger.debug("PluginMiddleware patched AgentLoop._execute_tool")
 
-    # ── Dispatchers ───────────────────────────────────────────────────────────
+    # ── Dispatchers (using pluggy hooks) ──────────────────────────────────
 
     async def _dispatch_on_tool_call(
         self, tool_name: str, arguments: dict[str, Any]
     ) -> None:
-        plugins = self._manager.tool_event_plugins
-        logger.debug("Dispatching on_tool_call to %d plugins", len(plugins))
-        for plugin in plugins:
-            try:
-                await self._call_with_circuit_breaker(
-                    plugin.on_tool_call, tool_name, arguments, self._context
-                )
-            except pybreaker.CircuitBreakerError:
-                logger.warning(
-                    "Plugin %s on_tool_call skipped due to open circuit (%s)",
-                    plugin.metadata().name,
-                    tool_name,
-                )
-            except Exception:
-                logger.exception(
-                    "Plugin %s raised in on_tool_call(%s)",
-                    plugin.metadata().name,
-                    tool_name,
-                )
+        """Dispatch on_tool_call hook using pluggy."""
+        logger.debug("Dispatching on_tool_call via pluggy")
+        try:
+            # Call the hook - pluggy will invoke all registered implementations
+            results = self._manager._pluggy_pm.hook.on_tool_call(
+                tool_name=tool_name,
+                arguments=arguments,
+                context=self._context,
+            )
+            # Handle async implementations - results may contain coroutines
+            if results:
+                # Filter out None results and check for coroutines
+                async_tasks = []
+                sync_results = []
+                for r in results:
+                    if asyncio.iscoroutine(r):
+                        async_tasks.append(r)
+                    elif r is not None:
+                        sync_results.append(r)
+                if async_tasks:
+                    await asyncio.gather(*async_tasks, return_exceptions=True)
+        except Exception as e:
+            logger.exception("Error dispatching on_tool_call hook: %s", e)
 
     async def _dispatch_on_tool_result(
         self, tool_name: str, arguments: dict[str, Any], result: str
     ) -> None:
-        plugins = self._manager.tool_event_plugins
-        for plugin in plugins:
-            try:
-                await self._call_with_circuit_breaker(
-                    plugin.on_tool_result, tool_name, arguments, result, self._context
-                )
-            except pybreaker.CircuitBreakerError:
-                logger.warning(
-                    "Plugin %s on_tool_result skipped due to open circuit (%s)",
-                    plugin.metadata().name,
-                    tool_name,
-                )
-            except Exception:
-                logger.exception(
-                    "Plugin %s raised in on_tool_result(%s)",
-                    plugin.metadata().name,
-                    tool_name,
-                )
+        """Dispatch on_tool_result hook using pluggy."""
+        logger.debug("Dispatching on_tool_result via pluggy")
+        try:
+            # Call the hook - pluggy will invoke all registered implementations
+            results = self._manager._pluggy_pm.hook.on_tool_result(
+                tool_name=tool_name,
+                arguments=arguments,
+                result=result,
+                context=self._context,
+            )
+            # Handle async implementations
+            if results:
+                async_tasks = []
+                sync_results = []
+                for r in results:
+                    if asyncio.iscoroutine(r):
+                        async_tasks.append(r)
+                    elif r is not None:
+                        sync_results.append(r)
+                if async_tasks:
+                    await asyncio.gather(*async_tasks, return_exceptions=True)
+        except Exception as e:
+            logger.exception("Error dispatching on_tool_result hook: %s", e)

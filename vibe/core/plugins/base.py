@@ -39,8 +39,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import pluggy
+
 if TYPE_CHECKING:
     from vibe.core.config import VibeConfig
+
+# Hook implementation marker for pluggy
+hookimpl = pluggy.HookimplMarker("mistral-vibe")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -174,6 +179,7 @@ class ToolEventPlugin(VibePlugin, abc.ABC):
         "ls",
     })
 
+    @hookimpl
     async def on_tool_call(
         self, tool_name: str, arguments: dict[str, Any], context: PluginContext
     ) -> None:
@@ -189,6 +195,7 @@ class ToolEventPlugin(VibePlugin, abc.ABC):
             Current plugin context.
         """
 
+    @hookimpl
     async def on_tool_result(
         self,
         tool_name: str,

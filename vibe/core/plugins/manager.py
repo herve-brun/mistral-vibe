@@ -40,7 +40,7 @@ import pluggy
 from vibe.core.plugins.base import PluginContext, ToolEventPlugin, VibePlugin
 from vibe.core.plugins.command_plugin import CommandPlugin
 from vibe.core.plugins.resilience import get_plugin_circuit_breaker
-from vibe.core.plugins.extension_points import HookSpecs
+from vibe.core.plugins.extension_points import HookSpecs, HookImplMarker
 
 if TYPE_CHECKING:
     from vibe.core.config import VibeConfig
@@ -137,6 +137,8 @@ class PluginManager:
             self._plugins.append(instance)
             if isinstance(instance, ToolEventPlugin):
                 self._tool_event_plugins.append(instance)
+                # Register with pluggy for hook dispatch
+                self._pluggy_pm.register(instance)
                 logger.debug("Registered tool event plugin: %s", instance.metadata().name)
 
             logger.info("Plugin %s (%s) ACTIVATED", meta.name, meta.version)
