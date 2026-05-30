@@ -83,6 +83,8 @@ class ToolManager:
         self._instances: dict[str, BaseTool] = {}
         # Track which tools came from plugins (for filtering)
         self._plugin_tools: set[str] = set()
+        # Track which plugin contributed each tool (for usage tracking)
+        self._tool_to_plugin: dict[str, str] = {}  # tool_name -> plugin_name
         self._search_paths: list[Path] = self._compute_search_paths(self._config)
         self._lock = threading.Lock()
         self._mcp_integrated = False
@@ -425,22 +427,76 @@ class ToolManager:
     def invalidate_tool(self, tool_name: str) -> None:
         self._instances.pop(tool_name, None)
 
-    def register_dynamic_tool(self, tool_class: type[BaseTool]) -> None:
-        """Register a tool dynamically at runtime.
-
+    def register_dynamic_tool(self, tool_class: type[BaseTool], plugin_name: str | None = None, overwrite: bool = False) -> None:
+        """Register a tool class that was dynamically created by a plugin.
+        
         Used by plugins to inject tools that aren't discovered from files.
+        
+        Parameters
+        ----------
+        tool_class:
+            The tool class to register
+        plugin_name:
+            Name of the plugin contributing this tool (for usage tracking)
+        overwrite:
+            If True, overwrite existing tool with the same name
+            
+        Raises
+        ------
+        TypeError
+            If tool_class is not a subclass of BaseTool
         """
+        if not issubclass(tool_class, BaseTool) or tool_class is BaseTool:
+            raise TypeError(f"{tool_class.__name__} is not a valid tool class")
+        
         tool_name = tool_class.get_name()
+        if tool_name in self._available:
+            if not overwrite:
+                logger.warning("Tool '%s' already registered, skipping", tool_name)
+                return
+            logger.debug("Overwriting existing tool '%s'", tool_name)
+        
         self._available[tool_name] = tool_class
         self._plugin_tools.add(tool_name)
+        if plugin_name:
+            self._tool_to_plugin[tool_name] = plugin_name
+            logger.debug("Registered tool '%s' from plugin '%s'", tool_name, plugin_name)
 
-    def register_dynamic_tool_instance(self, tool: BaseTool) -> None:
-        """Register a tool instance dynamically at runtime.
-
+    def register_dynamic_tool_instance(self, tool: BaseTool, plugin_name: str | None = None) -> None:
+        """Register a pre-configured tool instance.
+        
         Used by plugins to inject pre-configured tool instances with
-        all attributes already attached (e.g., LSP tools with _clients).
+        specific state (e.g., LSP tools with client connections).
+        
+        Parameters
+        ----------
+        tool:
+            The tool instance to register
+        plugin_name:
+            Name of the plugin contributing this tool (for usage tracking)
         """
         tool_name = tool.get_name()
-        self._available[tool_name] = type(tool)
+        if tool_name in self._instances:
+            logger.warning("Tool instance '%s' already registered, replacing", tool_name)
+        
         self._instances[tool_name] = tool
         self._plugin_tools.add(tool_name)
+        if plugin_name:
+            self._tool_to_plugin[tool_name] = plugin_name
+            logger.debug("Registered tool instance '%s' from plugin '%s'", tool_name, plugin_name)
+    
+    def get_plugin_for_tool(self, tool_name: str) -> str | None:
+        """Get the name of the plugin that contributed a specific tool.
+        
+        Parameters
+        ----------
+        tool_name:
+            Name of the tool to look up
+            
+        Returns
+        -------
+        str | None:
+            Name of the plugin that contributed the tool, or None if the tool
+            was not contributed by a plugin or the origin is unknown.
+        """
+        return self._tool_to_plugin.get(tool_name)

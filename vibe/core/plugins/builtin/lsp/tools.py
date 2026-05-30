@@ -24,6 +24,7 @@ Available tools
   lsp_rename        — rename a symbol safely
   lsp_implementation — find interface/protocol implementations
   lsp_type_definition — find type definitions
+  lsp_symbol_references — find references to a symbol by name in a file
   lsp_status        — show which LSPs are active
   lsp_debug         — launch interactive LSP inspector
 
@@ -39,6 +40,7 @@ BaseTool contract (inferred from mypy diagnostics on the real Vibe source)
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+import difflib
 import functools
 import json
 import logging
@@ -47,6 +49,12 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote
 
 from pydantic import BaseModel, Field
+
+
+class LspError(Exception):
+    """Exception raised for LSP-related errors."""
+    pass
+
 
 from vibe.core.tools.base import (  # type: ignore[import]
     BaseTool,
@@ -153,7 +161,14 @@ _LspResult = TypeVar("_LspResult", bound=BaseModel)
 class LspToolConfig(BaseToolConfig):
     """Configuration for LSP tools."""
 
-    pass
+    fuzzy_match: bool = Field(
+        default=True,
+        description="Enable fuzzy matching for symbol names when exact matches are not found."
+    )
+    fuzzy_match_cutoff: float = Field(
+        default=0.6,
+        description="Similarity threshold for fuzzy matching (0.0 to 1.0)."
+    )
 
 
 class _LspBaseTool(BaseTool[_LspArgs, _LspResult, LspToolConfig, BaseToolState]):
@@ -1806,6 +1821,208 @@ class LspDebugTool(
         )
 
 
+# ── lsp_symbol_references ────────────────────────────────────────────────────
+
+
+class LspSymbolReferencesArgs(BaseModel):
+    file_path: str = Field(description="Path to the source file.")
+    symbol_name: str = Field(description="Name of the symbol to find references for.")
+
+
+class LspSymbolReferencesResult(BaseModel):
+    references: list[dict[str, Any]] | None = Field(default=None)
+    symbol_location: dict[str, Any] | None = Field(default=None)
+    message: str
+
+
+class LspSymbolReferencesTool(
+    _LspBaseTool[LspSymbolReferencesArgs, LspSymbolReferencesResult],
+    ToolUIData[LspSymbolReferencesArgs, LspSymbolReferencesResult],
+):
+    name = "lsp_symbol_references"
+    description = (
+        "Find all references to a symbol by name in a file. "
+        "First finds the symbol's position using document symbols, then finds all references to that position. "
+        "Supports fuzzy matching when exact matches are not found."
+    )
+
+    def _find_fuzzy_matches(self, symbol_name: str, symbols: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Find fuzzy matches for a symbol name using difflib."""
+        config = self.config
+        if not config.fuzzy_match:
+            return []
+        
+        symbol_names = [s.get("name", "") for s in symbols if s.get("name")]
+        close_matches = difflib.get_close_matches(
+            symbol_name, 
+            symbol_names, 
+            n=5, 
+            cutoff=config.fuzzy_match_cutoff
+        )
+        
+        logger.debug(f"Fuzzy matching for '{symbol_name}': found {len(close_matches)} close matches: {close_matches}")
+        
+        # Return the full symbol objects for the matched names
+        fuzzy_matches = []
+        for match_name in close_matches:
+            for symbol in symbols:
+                if symbol.get("name") == match_name:
+                    fuzzy_matches.append(symbol)
+                    break
+        
+        return fuzzy_matches
+
+    async def run(
+        self, args: LspSymbolReferencesArgs, ctx: InvokeContext | None = None
+    ) -> AsyncGenerator[ToolStreamEvent | LspSymbolReferencesResult, None]:
+        if not isinstance(args, LspSymbolReferencesArgs):
+            yield ToolStreamEvent(
+                tool_name=self.get_name(),
+                message="Missing required parameters: file_path, symbol_name",
+                tool_call_id=ctx.tool_call_id if ctx else "",
+            )
+            return
+
+        file_path = args.file_path
+        symbol_name = args.symbol_name
+        client = self._client_for(file_path)
+        if client is None:
+            # Critical error: LSP client not available
+            raise LspError(f"LSP client not available: {self._no_client_msg(file_path)}")
+
+        try:
+            # Step 1: Get all document symbols
+            symbols = await client.document_symbols(file_path)
+            
+             # Step 2: Find the symbol with the matching name (exact match first)
+            matching_symbols = [
+                s for s in symbols 
+                if s.get("name") == symbol_name or s.get("name") == f"self.{symbol_name}"
+            ]
+            
+            config = self.config
+            
+            if not matching_symbols:
+                 # Try fuzzy matching if enabled
+                 if config and config.fuzzy_match:
+                     fuzzy_matches = self._find_fuzzy_matches(symbol_name, symbols)
+                     if fuzzy_matches:
+                         logger.info(f"Using fuzzy match for '{symbol_name}': found {len(fuzzy_matches)} potential matches")
+                         matching_symbols = fuzzy_matches
+                         
+                         # If we have multiple fuzzy matches, return them as suggestions
+                         if len(fuzzy_matches) > 1:
+                             symbol_names = [s.get("name", "") for s in fuzzy_matches]
+                             result = LspSymbolReferencesResult(
+                                 references=None,
+                                 symbol_location=None,
+                                 message=(
+                                     f"No exact match for '{symbol_name}'. "
+                                     f"Did you mean one of these? {', '.join(symbol_names[:3])}... "
+                                     f"(Use exact symbol name for precise results)"
+                                 )
+                             )
+                             yield result
+                             return
+                         # else: single fuzzy match - continue to use it
+                     else:
+                         logger.debug(f"No fuzzy matches found for '{symbol_name}' with cutoff {config.fuzzy_match_cutoff if config else 'default'}")
+                 
+                 # If we still don't have matches (fuzzy matching disabled or no fuzzy matches found)
+                 if not matching_symbols:
+                     # No matches found at all (neither exact nor fuzzy)
+                     result = LspSymbolReferencesResult(
+                         references=None,
+                         symbol_location=None,
+                         message=f"No symbol named '{symbol_name}' found in {file_path}"
+                     )
+                     yield result
+                     return
+             
+             # At this point, we have either exact matches or a single fuzzy match
+
+            # Use the first matching symbol (most specific match)
+            symbol = matching_symbols[0]
+            
+            # Step 3: Get the symbol's location (line and column)
+            # The symbol should have range information
+            symbol_range = symbol.get("range") or symbol.get("location", {}).get("range")
+            if symbol_range:
+                # Extract line and column from range (LSP uses 0-indexed, we need 1-indexed)
+                start = symbol_range.get("start", {})
+                line = start.get("line", 0) + 1  # Convert to 1-indexed
+                col = start.get("character", 0) + 1  # Convert to 1-indexed
+                symbol_location = {
+                    "file": file_path,
+                    "line": line,
+                    "col": col,
+                    "name": symbol.get("name", symbol_name),
+                    "kind": symbol.get("kind", "Unknown")
+                }
+            else:
+                # Fallback: use the symbol's line/col if available directly
+                line = symbol.get("line", 1)
+                col = symbol.get("col", 1)
+                symbol_location = {
+                    "file": file_path,
+                    "line": line,
+                    "col": col,
+                    "name": symbol.get("name", symbol_name),
+                    "kind": symbol.get("kind", "Unknown")
+                }
+            
+            # Step 4: Get references for the symbol's position
+            refs = await client.references(file_path, line, col, include_declaration=True)
+            
+            # Non-critical case: no references found
+            if not refs:
+                logger.debug(f"No references found to '{symbol_name}'")
+                message = f"No references found to '{symbol_name}'"
+            else:
+                message = f"Found {len(refs)} references to '{symbol_name}'"
+            
+            result = LspSymbolReferencesResult(
+                references=refs if refs else None,
+                symbol_location=symbol_location,
+                message=message
+            )
+            yield result
+            
+        except Exception as exc:
+            # Critical error: unexpected LSP error
+            raise LspError(f"LSP error: {exc}")
+
+    @classmethod
+    def format_call_display(cls, args: LspSymbolReferencesArgs) -> ToolCallDisplay:
+        return ToolCallDisplay(
+            summary=f"Finding references to '{args.symbol_name}' in {args.file_path}"
+        )
+
+    @classmethod
+    def get_result_display(cls, event: Any) -> ToolResultDisplay:
+        if not isinstance(event.result, LspSymbolReferencesResult):
+            return ToolResultDisplay(
+                success=False, message=event.error or event.skip_reason or "No result"
+            )
+
+        if event.result.references and len(event.result.references) > 0:
+            symbol_name = event.result.symbol_location.get('name', 'symbol') if event.result.symbol_location else 'symbol'
+            return ToolResultDisplay(
+                success=True,
+                message=f"Found {len(event.result.references)} references to '{symbol_name}'",
+            )
+        return ToolResultDisplay(success=True, message=event.result.message)
+
+    @classmethod
+    @functools.cache
+    def get_tool_prompt(cls) -> str | None:
+        return (
+            "Use lsp_symbol_references(file_path, symbol_name) to find all references "
+            "to a specific symbol by its name in a file. This first locates the symbol "
+            "using document symbols, then finds all references to that position."
+        )
+
+
 # ── Factory ───────────────────────────────────────────────────────────────────
 
 
@@ -1841,6 +2058,10 @@ def make_lsp_tools(
 
     lsp_config = LspToolConfig()
     tools: list[BaseTool] = []
+    
+    # Create a config getter function that returns the LSP config
+    def get_lsp_config() -> LspToolConfig:
+        return lsp_config
 
     for cls in [
         LspDiagnosticsTool,
@@ -1848,6 +2069,7 @@ def make_lsp_tools(
         LspHoverTool,
         LspDefinitionTool,
         LspReferencesTool,
+        LspSymbolReferencesTool,
         LspDocumentSymbolsTool,
         LspWorkspaceSymbolsTool,
         LspSignatureHelpTool,
@@ -1860,12 +2082,12 @@ def make_lsp_tools(
         LspImplementationTool,
         LspTypeDefinitionTool,
     ]:
-        tools.append(cls(lsp_config, state))
+        tools.append(cls(get_lsp_config, state))
 
-    status_tool = LspStatusTool(lsp_config, state)
+    status_tool = LspStatusTool(get_lsp_config, state)
     tools.append(status_tool)
 
-    debug_tool = LspDebugTool(lsp_config, state)
+    debug_tool = LspDebugTool(get_lsp_config, state)
     tools.append(debug_tool)
 
     return tools

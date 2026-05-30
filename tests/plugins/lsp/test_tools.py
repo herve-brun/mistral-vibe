@@ -37,6 +37,8 @@ from vibe.core.plugins.builtin.lsp.tools import (
     LspSignatureHelpResult,
     LspStatusArgs,
     LspStatusResult,
+    LspSymbolReferencesArgs,
+    LspSymbolReferencesResult,
     LspTypeDefinitionArgs,
     LspTypeDefinitionResult,
     LspWorkspaceSymbolsArgs,
@@ -687,3 +689,313 @@ class TestLspRenameArgs:
             new_name="NewName",
         )
         assert args.new_name == "NewName"
+
+
+class TestLspSymbolReferencesArgs:
+    """Tests for LspSymbolReferencesArgs model."""
+
+    def test_file_path_required(self):
+        args = LspSymbolReferencesArgs(file_path="/path/to/file.py", symbol_name="TestClass")
+        assert args.file_path == "/path/to/file.py"
+
+    def test_symbol_name_required(self):
+        args = LspSymbolReferencesArgs(file_path="/path/to/file.py", symbol_name="TestClass")
+        assert args.symbol_name == "TestClass"
+
+    def test_handles_class_names(self):
+        args = LspSymbolReferencesArgs(file_path="/path/to/file.py", symbol_name="MyClass")
+        assert args.symbol_name == "MyClass"
+
+    def test_handles_function_names(self):
+        args = LspSymbolReferencesArgs(file_path="/path/to/file.py", symbol_name="my_function")
+        assert args.symbol_name == "my_function"
+
+    def test_handles_variable_names(self):
+        args = LspSymbolReferencesArgs(file_path="/path/to/file.py", symbol_name="my_var")
+        assert args.symbol_name == "my_var"
+
+
+class TestLspSymbolReferencesResult:
+    """Tests for LspSymbolReferencesResult model."""
+
+    def test_default_values(self):
+        result = LspSymbolReferencesResult(message="Test message")
+        assert result.references is None
+        assert result.symbol_location is None
+        assert result.message == "Test message"
+
+    def test_with_references(self):
+        refs = [{"file": "test.py", "line": 1, "col": 1}]
+        result = LspSymbolReferencesResult(
+            references=refs,
+            symbol_location={"file": "test.py", "line": 10, "col": 5},
+            message="Found references"
+        )
+        assert result.references == refs
+        assert result.symbol_location["line"] == 10
+        assert result.message == "Found references"
+
+
+class TestLspSymbolReferencesTool:
+    """Tests for LspSymbolReferencesTool."""
+
+    def test_name_is_symbol_references(self):
+        from vibe.core.plugins.builtin.lsp.tools import LspSymbolReferencesTool
+
+        assert LspSymbolReferencesTool.name == "lsp_symbol_references"
+
+    def test_description_contains_symbol_references(self):
+        from vibe.core.plugins.builtin.lsp.tools import LspSymbolReferencesTool
+
+        assert "symbol" in LspSymbolReferencesTool.description.lower()
+        assert "references" in LspSymbolReferencesTool.description.lower()
+
+    def test_get_tool_prompt_returns_string(self):
+        from vibe.core.plugins.builtin.lsp.tools import LspSymbolReferencesTool
+
+        prompt = LspSymbolReferencesTool.get_tool_prompt()
+        assert prompt is not None
+        assert "symbol" in prompt.lower()
+        assert "references" in prompt.lower()
+
+    @pytest.mark.asyncio
+    async def test_run_returns_no_client_message(self, mock_clients, mock_config, mock_state):
+        lsp_tools._LSP_CLIENTS = mock_clients
+
+        from vibe.core.plugins.builtin.lsp.tools import LspSymbolReferencesTool
+
+        tool = LspSymbolReferencesTool(mock_config, mock_state)
+        args = LspSymbolReferencesArgs(file_path="/fake/test.py", symbol_name="TestClass")
+
+        results = list(tool.run(args))
+        assert len(results) >= 1
+
+        result = results[-1]
+        assert isinstance(result, LspSymbolReferencesResult)
+        assert "not running" in result.message.lower() or "not configured" in result.message.lower()
+
+    @pytest.mark.asyncio
+    async def test_run_with_mock_client_no_symbols(self, mock_config, mock_state):
+        from vibe.core.plugins.builtin.lsp.tools import LspSymbolReferencesTool
+
+        # Create a mock client that returns no symbols
+        mock_client = MagicMock()
+        mock_client.document_symbols = AsyncMock(return_value=[])
+        lsp_tools._LSP_CLIENTS = {"python": mock_client}
+
+        tool = LspSymbolReferencesTool(mock_config, mock_state)
+        args = LspSymbolReferencesArgs(file_path="/fake/test.py", symbol_name="NonExistent")
+
+        results = list(tool.run(args))
+        result = results[-1]
+
+        assert isinstance(result, LspSymbolReferencesResult)
+        assert result.references is None
+        assert result.symbol_location is None
+        assert "No symbol named" in result.message
+
+    @pytest.mark.asyncio
+    async def test_run_with_mock_client_symbol_found_no_references(self, mock_config, mock_state):
+        from vibe.core.plugins.builtin.lsp.tools import LspSymbolReferencesTool
+
+        # Create a mock client that returns symbols but no references
+        mock_client = MagicMock()
+        mock_symbol = {
+            "name": "TestClass",
+            "kind": 5,  # Class
+            "range": {
+                "start": {"line": 9, "character": 4},  # 0-indexed
+                "end": {"line": 9, "character": 13}
+            }
+        }
+        mock_client.document_symbols = AsyncMock(return_value=[mock_symbol])
+        mock_client.references = AsyncMock(return_value=[])
+        lsp_tools._LSP_CLIENTS = {"python": mock_client}
+
+        tool = LspSymbolReferencesTool(mock_config, mock_state)
+        args = LspSymbolReferencesArgs(file_path="/fake/test.py", symbol_name="TestClass")
+
+        results = list(tool.run(args))
+        result = results[-1]
+
+        assert isinstance(result, LspSymbolReferencesResult)
+        assert result.symbol_location is not None
+        assert result.symbol_location["name"] == "TestClass"
+        assert result.symbol_location["line"] == 10  # Converted to 1-indexed
+        assert result.symbol_location["col"] == 5  # Converted to 1-indexed
+        assert result.references == []
+        assert "0 references" in result.message
+
+    @pytest.mark.asyncio
+    async def test_run_with_mock_client_symbol_found_with_references(self, mock_config, mock_state):
+        from vibe.core.plugins.builtin.lsp.tools import LspSymbolReferencesTool
+
+        # Create a mock client that returns symbols and references
+        mock_client = MagicMock()
+        mock_symbol = {
+            "name": "my_function",
+            "kind": 12,  # Function
+            "range": {
+                "start": {"line": 4, "character": 8},  # 0-indexed
+                "end": {"line": 4, "character": 18}
+            }
+        }
+        mock_client.document_symbols = AsyncMock(return_value=[mock_symbol])
+        mock_references = [
+            {"file": "/fake/test.py", "line": 10, "col": 5},
+            {"file": "/fake/test.py", "line": 20, "col": 10},
+            {"file": "/fake/other.py", "line": 5, "col": 15}
+        ]
+        mock_client.references = AsyncMock(return_value=mock_references)
+        lsp_tools._LSP_CLIENTS = {"python": mock_client}
+
+        tool = LspSymbolReferencesTool(mock_config, mock_state)
+        args = LspSymbolReferencesArgs(file_path="/fake/test.py", symbol_name="my_function")
+
+        results = list(tool.run(args))
+        result = results[-1]
+
+        assert isinstance(result, LspSymbolReferencesResult)
+        assert result.symbol_location is not None
+        assert result.symbol_location["name"] == "my_function"
+        assert result.symbol_location["line"] == 5  # Converted to 1-indexed
+        assert result.symbol_location["col"] == 9  # Converted to 1-indexed
+        assert result.references == mock_references
+        assert "3 references" in result.message
+
+    @pytest.mark.asyncio
+    async def test_run_with_mock_client_multiple_matching_symbols(self, mock_config, mock_state):
+        from vibe.core.plugins.builtin.lsp.tools import LspSymbolReferencesTool
+
+        # Create a mock client that returns multiple symbols with the same name
+        mock_client = MagicMock()
+        mock_symbols = [
+            {
+                "name": "TestClass",
+                "kind": 5,  # Class
+                "range": {
+                    "start": {"line": 9, "character": 4},
+                    "end": {"line": 9, "character": 13}
+                }
+            },
+            {
+                "name": "TestClass",
+                "kind": 5,  # Class (duplicate name, e.g., in different namespace)
+                "range": {
+                    "start": {"line": 19, "character": 4},
+                    "end": {"line": 19, "character": 13}
+                }
+            }
+        ]
+        mock_client.document_symbols = AsyncMock(return_value=mock_symbols)
+        mock_references = [{"file": "/fake/test.py", "line": 25, "col": 1}]
+        mock_client.references = AsyncMock(return_value=mock_references)
+        lsp_tools._LSP_CLIENTS = {"python": mock_client}
+
+        tool = LspSymbolReferencesTool(mock_config, mock_state)
+        args = LspSymbolReferencesArgs(file_path="/fake/test.py", symbol_name="TestClass")
+
+        results = list(tool.run(args))
+        result = results[-1]
+
+        # Should use the first matching symbol
+        assert isinstance(result, LspSymbolReferencesResult)
+        assert result.symbol_location is not None
+        assert result.symbol_location["name"] == "TestClass"
+        assert result.symbol_location["line"] == 10  # First symbol's line (converted to 1-indexed)
+        assert result.references == mock_references
+
+    @pytest.mark.asyncio
+    async def test_run_with_lsp_error(self, mock_config, mock_state):
+        from vibe.core.plugins.builtin.lsp.tools import LspSymbolReferencesTool
+
+        # Create a mock client that raises an error
+        mock_client = MagicMock()
+        mock_client.document_symbols = AsyncMock(side_effect=Exception("LSP connection failed"))
+        lsp_tools._LSP_CLIENTS = {"python": mock_client}
+
+        tool = LspSymbolReferencesTool(mock_config, mock_state)
+        args = LspSymbolReferencesArgs(file_path="/fake/test.py", symbol_name="TestClass")
+
+        results = list(tool.run(args))
+        result = results[-1]
+
+        assert isinstance(result, LspSymbolReferencesResult)
+        assert result.references is None
+        assert result.symbol_location is None
+        assert "LSP error" in result.message
+
+    def test_format_call_display(self):
+        from vibe.core.plugins.builtin.lsp.tools import LspSymbolReferencesTool
+
+        args = LspSymbolReferencesArgs(file_path="/path/to/file.py", symbol_name="TestClass")
+        display = LspSymbolReferencesTool.format_call_display(args)
+
+        assert display.summary is not None
+        assert "TestClass" in display.summary
+        assert "/path/to/file.py" in display.summary
+
+    def test_get_result_display_success(self):
+        from vibe.core.plugins.builtin.lsp.tools import LspSymbolReferencesTool
+        from vibe.core.types import ToolResultEvent
+
+        references = [{"file": "test.py", "line": 1, "col": 1}]
+        result = LspSymbolReferencesResult(
+            references=references,
+            symbol_location={"name": "TestClass", "line": 10, "col": 5},
+            message="Found 1 references to 'TestClass'"
+        )
+        event = ToolResultEvent(
+            tool_name="lsp_symbol_references",
+            result=result,
+            tool_call_id="test-123"
+        )
+
+        display = LspSymbolReferencesTool.get_result_display(event)
+
+        assert display.success is True
+        assert "TestClass" in display.message
+        assert "1 references" in display.message
+
+    def test_get_result_display_no_references(self):
+        from vibe.core.plugins.builtin.lsp.tools import LspSymbolReferencesTool
+        from vibe.core.types import ToolResultEvent
+
+        result = LspSymbolReferencesResult(
+            references=None,
+            symbol_location={"name": "TestClass", "line": 10, "col": 5},
+            message="No references found to 'TestClass'"
+        )
+        event = ToolResultEvent(
+            tool_name="lsp_symbol_references",
+            result=result,
+            tool_call_id="test-123"
+        )
+
+        display = LspSymbolReferencesTool.get_result_display(event)
+
+        assert display.success is True
+        assert "No references" in display.message
+
+    def test_get_result_display_error(self):
+        from vibe.core.plugins.builtin.lsp.tools import LspSymbolReferencesTool
+        from vibe.core.types import ToolResultEvent
+
+        event = ToolResultEvent(
+            tool_name="lsp_symbol_references",
+            result=None,
+            error="Test error",
+            tool_call_id="test-123"
+        )
+
+        display = LspSymbolReferencesTool.get_result_display(event)
+
+        assert display.success is False
+        assert display.message == "Test error"
+
+    def test_get_status_text(self):
+        from vibe.core.plugins.builtin.lsp.tools import LspSymbolReferencesTool
+
+        status = LspSymbolReferencesTool.get_status_text()
+        assert status is not None
+        assert "LSP" in status or "Querying" in status

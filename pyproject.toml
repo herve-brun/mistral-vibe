@@ -65,6 +65,7 @@ dependencies = [
     "watchfiles>=1.1.1",
     "websockets>=13.0",
     "zstandard>=0.25.0",
+    "structlog>=25.5.0",
     # ── LSP plugin ────────────────────────────────────────────────────────────
     # lsp-client provides async LSP client supporting lsprotocol 2025+.
     # vibe/core/plugins/builtin/lsp/lsp_client.py uses lsp-client to communicate

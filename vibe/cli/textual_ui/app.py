@@ -792,8 +792,10 @@ class VibeApp(App):  # noqa: PLR0904
             # Execute the handler and capture its return value
             if asyncio.iscoroutinefunction(handler):
                 result = await handler(cmd_args=cmd_args)
-            else:
+            elif callable(handler):
                 result = handler(cmd_args=cmd_args)
+            else:
+                raise ValueError(f"Handler {handler} is not callable")
 
             # If the handler returned a string, display it in the chat
             if result is not None and isinstance(result, str):
@@ -1420,10 +1422,86 @@ class VibeApp(App):  # noqa: PLR0904
         await self._switch_to_config_app()
 
     async def _show_plugins_status(self, **kwargs: Any) -> None:
-        """Display the status of all active plugins."""
+        """Display the status of all active plugins in a table format."""
         summary = self.agent_loop.plugin_manager.summary()
-        plugins_text = f"## Plugins Status\n\n{summary}"
+        print("=== RAW SUMMARY ===\n", summary, "\n=== END RAW SUMMARY ===")
+        plugins_text = f"## Plugins Status\n\n{self._format_plugins_as_table(summary)}"
         await self._mount_and_scroll(UserCommandMessage(plugins_text))
+
+    def _format_plugins_as_table(self, summary: str) -> str:
+        """Convert plugin summary into a markdown table, with special handling for LSP."""
+        lines = summary.split('\n')
+        table_lines = ["| Name | Description | Priority | Circuit Breaker |"]
+        table_lines.append("|------|-------------|----------|----------------|")
+        
+        current_plugin = {}
+        in_lsp_section = False
+        lsp_details = []
+        
+        for line in lines:
+            if line.startswith("### "):
+                if current_plugin:
+                    # Add LSP details to description if present
+                    if lsp_details:
+                        current_plugin["description"] += "\n\n" + "\n".join(lsp_details)
+                        lsp_details = []
+                    
+                    # Remove redundant "Configuration:" from description
+                    if "description" in current_plugin:
+                        current_plugin["description"] = current_plugin["description"].replace("Configuration:", "").strip()
+                    
+                    table_lines.append(
+                        f"| {current_plugin.get('name', '')} | {current_plugin.get('description', '')} | {current_plugin.get('priority', '')} | {current_plugin.get('circuit_breaker', '')} |"
+                    )
+                current_plugin = {"name": line[4:].strip()}
+                in_lsp_section = (line[4:].strip() == "lsp")
+            elif line.startswith("-") and "Priority:" in line:
+                current_plugin["priority"] = line.split(":")[1].strip()
+            elif line.startswith("-") and "Circuit Breaker:" in line:
+                current_plugin["circuit_breaker"] = line.split(":")[1].strip()
+            elif in_lsp_section and line.startswith("**LSP Servers:**"):
+                lsp_details.append(line)
+            elif in_lsp_section and "Detected Languages:" in line:
+                lsp_details.append(f"  {line.strip()}")
+            elif in_lsp_section and "Active Servers:" in line:
+                lsp_details.append(f"  {line.strip()}")
+            elif in_lsp_section and line.strip().startswith("-"):
+                lsp_details.append(f"    {line.strip()}")
+            elif line and not line.startswith("###") and not line.startswith("-"):
+                if "description" not in current_plugin:
+                    current_plugin["description"] = line.strip()
+                else:
+                    current_plugin["description"] += " " + line.strip()
+        
+        if current_plugin:
+            if lsp_details:
+                current_plugin["description"] += "\n\n" + "\n".join(lsp_details)
+            # Remove redundant "Configuration:" from description
+            if "description" in current_plugin:
+                current_plugin["description"] = current_plugin["description"].replace("Configuration:", "").strip()
+            table_lines.append(
+                f"| {current_plugin.get('name', '')} | {current_plugin.get('description', '')} | {current_plugin.get('priority', '')} | {current_plugin.get('circuit_breaker', '')} |"
+            )
+        
+        return "\n".join(table_lines)
+
+    async def _show_plugin_stats(self, **kwargs: Any) -> None:
+        """Display plugin usage statistics in a table format."""
+        stats = self.agent_loop.plugin_manager.get_plugin_statistics()
+        if not stats:
+            await self._mount_and_scroll(UserCommandMessage("No plugin statistics available."))
+            return
+        
+        table_lines = ["| Plugin | Calls | Errors | Total Time (s) | Avg Time (s) | Circuit Breaker |"]
+        table_lines.append("|--------|-------|--------|----------------|--------------|----------------|")
+        
+        for plugin_data in stats:
+            table_lines.append(
+                f"| {plugin_data['name']} | {plugin_data.get('calls', 0)} | {plugin_data.get('errors', 0)} | {plugin_data.get('total_time', 0.0):.2f} | {plugin_data.get('avg_time', 0.0):.2f} | {plugin_data.get('circuit_breaker', 'N/A')} |"
+            )
+        
+        stats_text = "## Plugin Statistics\n\n" + "\n".join(table_lines)
+        await self._mount_and_scroll(UserCommandMessage(stats_text))
 
     async def _show_model(self, **kwargs: Any) -> None:
         """Switch to the model picker in the bottom panel."""
@@ -1438,6 +1516,41 @@ class VibeApp(App):  # noqa: PLR0904
 
     async def _show_data_retention(self, **kwargs: Any) -> None:
         await self._mount_and_scroll(UserCommandMessage(DATA_RETENTION_MESSAGE))
+
+    async def _adjust_plugin_priority(self, cmd_args: str = "", **kwargs: Any) -> None:
+        """Adjust the priority of a plugin."""
+        try:
+            # Parse arguments
+            parts = cmd_args.strip().split()
+            if len(parts) != 2:
+                error_msg = (
+                    "[red]Error:[/] Usage: /adjust-priority <plugin_name> <priority>\n"
+                    "Example: /adjust-priority my_plugin 100"
+                )
+                await self._mount_and_scroll(UserCommandMessage(error_msg))
+                return
+            
+            plugin_name = parts[0]
+            try:
+                priority = int(parts[1])
+            except ValueError:
+                error_msg = f"[red]Error:[/] Priority must be an integer, got: {parts[1]}"
+                await self._mount_and_scroll(UserCommandMessage(error_msg))
+                return
+            
+            # Call the agent loop method
+            success = self.agent_loop.adjust_plugin_priority(plugin_name, priority)
+            
+            if success:
+                result_msg = f"✅ Adjusted priority for plugin '{plugin_name}' to {priority}"
+            else:
+                result_msg = f"⚠ Plugin '{plugin_name}' not found"
+            
+            await self._mount_and_scroll(UserCommandMessage(result_msg))
+            
+        except Exception as e:
+            error_msg = f"[red]Error:[/] Failed to adjust plugin priority: {e}"
+            await self._mount_and_scroll(UserCommandMessage(error_msg))
 
     async def _show_session_picker(self, **kwargs: Any) -> None:
         cwd = str(Path.cwd())

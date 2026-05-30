@@ -14,43 +14,67 @@ import asyncio
 import logging
 
 import pybreaker
+import structlog
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from vibe.core.config import VibeConfig
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class PluginCircuitListener:
     """Circuit breaker listener that logs state changes."""
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, plugin_name: str | None = None, file_path: str | None = None, line_number: int | None = None) -> None:
         self._name = name
+        self._plugin_name = plugin_name
+        self._file_path = file_path
+        self._line_number = line_number
 
     def __call__(self, cb: pybreaker.CircuitBreaker, ex: BaseException | None) -> None:
         """Called on state changes and failures."""
         state = cb.current_state
+        context = {
+            "circuit_name": self._name,
+            "plugin_name": self._plugin_name,
+            "file_path": self._file_path,
+            "line_number": self._line_number
+        }
+        
         if ex is not None:
-            logger.debug(
-                "Plugin circuit breaker [%s] recorded failure: %s",
-                self._name,
-                type(ex).__name__,
+            logger.error(
+                "Circuit breaker failure recorded",
+                circuit_name=self._name,
+                state=state,
+                error_type=type(ex).__name__,
+                error_message=str(ex),
+                extra={"context": context},
+                exc_info=True
             )
         elif state == pybreaker.STATE_OPEN:
             logger.warning(
-                "Plugin circuit breaker [%s] transitioned to OPEN",
-                self._name,
+                "Circuit breaker state change",
+                circuit_name=self._name,
+                old_state="closed_or_half_open",
+                new_state="open",
+                extra={"context": context}
             )
         elif state == pybreaker.STATE_CLOSED:
             logger.info(
-                "Plugin circuit breaker [%s] transitioned to CLOSED",
-                self._name,
+                "Circuit breaker state change",
+                circuit_name=self._name,
+                old_state="open_or_half_open",
+                new_state="closed",
+                extra={"context": context}
             )
         elif state == pybreaker.STATE_HALF_OPEN:
             logger.warning(
-                "Plugin circuit breaker [%s] transitioned to HALF_OPEN",
-                self._name,
+                "Circuit breaker state change",
+                circuit_name=self._name,
+                old_state="open",
+                new_state="half_open",
+                extra={"context": context}
             )
 
 
@@ -72,7 +96,7 @@ def _get_circuit_breaker(config: VibeConfig) -> pybreaker.CircuitBreaker:
         reset_timeout=timeout,
         exclude=[KeyboardInterrupt, asyncio.CancelledError],
     )
-    listener = PluginCircuitListener("plugin_ops")
+    listener = PluginCircuitListener("plugin_ops", plugin_name=None, file_path=None, line_number=None)
     breaker.add_listener(listener)  # type: ignore[arg-type]
     return breaker
 

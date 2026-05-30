@@ -33,6 +33,7 @@ from vibe.core.llm.format import (
     ResolvedToolCall,
 )
 from vibe.core.llm.types import BackendLike
+from vibe.core.logger import get_structured_logger
 from vibe.core.middleware import (
     CHAT_AGENT_EXIT,
     CHAT_AGENT_REMINDER,
@@ -49,141 +50,19 @@ from vibe.core.middleware import (
     TurnLimitMiddleware,
     make_plan_agent_reminder,
 )
-from vibe.core.plan_session import PlanSession
 from vibe.core.plugins import PluginContext, PluginManager, PluginMiddleware
-from vibe.core.prompts import UtilityPrompt
-from vibe.core.rewind import RewindManager
+from vibe.core.paths import VIBE_HOME
+from vibe.core.plugins.manager import PluginManager
 from vibe.core.session.session_logger import SessionLogger
-from vibe.core.session.session_migration import migrate_sessions_entrypoint
+from vibe.core.plan_session import PlanSession
 from vibe.core.skills.manager import SkillManager
-from vibe.core.system_prompt import get_universal_system_prompt
-from vibe.core.telemetry.send import TelemetryClient
-from vibe.core.tools.base import (
-    BaseTool,
-    InvokeContext,
-    ToolError,
-    ToolPermission,
-    ToolPermissionError,
-)
-from vibe.core.tools.connectors import ConnectorRegistry, connectors_enabled
 from vibe.core.tools.manager import ToolManager
 from vibe.core.tools.mcp import MCPRegistry
 from vibe.core.tools.mcp_sampling import MCPSamplingHandler
-from vibe.core.tools.permissions import (
-    ApprovedRule,
-    PermissionContext,
-    RequiredPermission,
-)
-from vibe.core.tools.utils import wildcard_match
-from vibe.core.tracing import agent_span, set_tool_result, tool_span
-from vibe.core.trusted_folders import has_agents_md_file
-from vibe.core.types import (
-    AgentProfileChangedEvent,
-    AgentStats,
-    ApprovalCallback,
-    ApprovalResponse,
-    AssistantEvent,
-    BaseEvent,
-    CompactEndEvent,
-    CompactStartEvent,
-    EntrypointMetadata,
-    LLMChunk,
-    LLMMessage,
-    LLMUsage,
-    MessageList,
-    RateLimitError,
-    ReasoningEvent,
-    Role,
-    ToolCall,
-    ToolCallEvent,
-    ToolResultEvent,
-    ToolStreamEvent,
-    UserInputCallback,
-    UserMessageEvent,
-)
-from vibe.core.utils import (
-    CANCELLATION_TAG,
-    TOOL_ERROR_TAG,
-    VIBE_STOP_EVENT_TAG,
-    CancellationReason,
-    get_server_url_from_api_base,
-    get_user_agent,
-    get_user_cancellation_message,
-    is_user_cancellation_event,
-)
+from vibe.core.tools.connectors import ConnectorRegistry, connectors_enabled
+from vibe.core.rewind import RewindManager
 
-try:
-    from vibe.core.teleport.teleport import TeleportService as _TeleportService
-
-    _TELEPORT_AVAILABLE = True
-except ImportError:
-    _TELEPORT_AVAILABLE = False
-    _TeleportService = None
-
-if TYPE_CHECKING:
-    from vibe.core.teleport.teleport import TeleportService
-    from vibe.core.teleport.types import TeleportPushResponseEvent, TeleportYieldEvent
-
-
-class ToolExecutionResponse(StrEnum):
-    SKIP = auto()
-    EXECUTE = auto()
-
-
-class ToolDecision(BaseModel):
-    verdict: ToolExecutionResponse
-    approval_type: ToolPermission
-    feedback: str | None = None
-
-
-class AgentLoopError(Exception):
-    """Base exception for AgentLoop errors."""
-
-
-class AgentLoopStateError(AgentLoopError):
-    """Raised when agent loop is in an invalid state."""
-
-
-class AgentLoopLLMResponseError(AgentLoopError):
-    """Raised when LLM response is malformed or missing expected data."""
-
-
-class TeleportError(AgentLoopError):
-    """Raised when teleport to Vibe Nuage fails."""
-
-
-def _should_raise_rate_limit_error(e: Exception) -> bool:
-    return isinstance(e, BackendError) and e.status == HTTPStatus.TOO_MANY_REQUESTS
-
-
-def requires_init(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Decorator that awaits deferred initialization before executing the method."""
-    if inspect.isasyncgenfunction(fn):
-
-        @wraps(fn)
-        async def gen_wrapper(self: AgentLoop, *args: Any, **kwargs: Any) -> Any:
-            await self.wait_until_ready()
-            agen = fn(self, *args, **kwargs)
-            sent: Any = None
-            try:
-                while True:
-                    sent = yield await agen.asend(sent)
-            except StopAsyncIteration:
-                return
-            finally:
-                await agen.aclose()
-
-        return gen_wrapper
-
-    @wraps(fn)
-    async def wrapper(self: AgentLoop, *args: Any, **kwargs: Any) -> Any:
-        await self.wait_until_ready()
-        return await fn(self, *args, **kwargs)
-
-    return wrapper
-
-
-logger = logging.getLogger(__name__)
+logger = get_structured_logger(__name__)
 
 
 class AgentLoop:
@@ -301,6 +180,9 @@ class AgentLoop:
         self.middleware_pipeline.add(self._plugin_middleware)
         # Patch _execute_tool to intercept tool calls/results
         self._plugin_middleware.patch_agent_loop(self)
+        
+        # Plugin usage tracking for automatic priority adjustment
+        # This will be connected to the middleware's tracker after initialization
 
         Thread(
             target=migrate_sessions_entrypoint,
@@ -357,6 +239,50 @@ class AgentLoop:
         if err := self._init_error:
             raise copy.copy(err).with_traceback(err.__traceback__)
 
+
+def requires_init(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Decorator that awaits deferred initialization before executing the method."""
+    if inspect.isasyncgenfunction(fn):
+
+        @wraps(fn)
+        async def gen_wrapper(self: AgentLoop, *args: Any, **kwargs: Any) -> Any:
+            await self.wait_until_ready()
+            agen = fn(self, *args, **kwargs)
+            sent: Any = None
+            try:
+                while True:
+                    sent = yield await agen.asend(sent)
+            except StopAsyncIteration:
+                return
+            finally:
+                await agen.aclose()
+
+        return gen_wrapper
+
+    @wraps(fn)
+    async def wrapper(self: AgentLoop, *args: Any, **kwargs: Any) -> Any:
+        await self.wait_until_ready()
+        return await fn(self, *args, **kwargs)
+
+    return wrapper
+
+
+class AgentLoopError(Exception):
+    """Base exception for AgentLoop errors."""
+
+
+class AgentLoopStateError(AgentLoopError):
+    """Raised when agent loop is in an invalid state."""
+
+
+class AgentLoopLLMResponseError(AgentLoopError):
+    """Raised when LLM response is malformed or missing expected data."""
+
+
+class TeleportError(AgentLoopError):
+    """Raised when teleport to Vibe Nuage fails."""
+
+
     @property
     def agent_profile(self) -> AgentProfile:
         return self.agent_manager.active_profile
@@ -387,6 +313,106 @@ class AgentLoop:
     def plugin_manager(self) -> PluginManager:
         """Expose the plugin manager to the rest of the application."""
         return self._plugin_manager
+
+    def adjust_plugin_priority(self, plugin_name: str, priority: int) -> bool:
+        """Adjust the runtime priority of a plugin.
+        
+        Parameters
+        ----------
+        plugin_name:
+            The name of the plugin to adjust
+        priority:
+            The new priority value (lower values run first)
+          
+        Returns
+        -------
+        bool:
+            True if the plugin was found and priority was adjusted, False otherwise
+        """
+        for plugin in self._plugin_manager.all_plugins:
+            if plugin.metadata().name == plugin_name:
+                plugin.set_runtime_priority(priority, self._plugin_context)
+                logger.debug("Adjusted priority for plugin %s to %d", plugin_name, priority)
+                return True
+          
+        logger.warning("Plugin %s not found for priority adjustment", plugin_name)
+        return False
+    
+    def _auto_adjust_priorities(self) -> None:
+        """Automatically adjust plugin priorities based on usage patterns.
+        
+        This method implements dynamic priority adjustment by:
+        - Lowering priority for plugins with frequent errors
+        - Raising priority for frequently used plugins
+        - Respecting minimum/maximum priority bounds
+        """
+        if not self.config.dynamic_priorities:
+            logger.debug("Dynamic priority adjustment disabled in config")
+            return
+            
+        logger.debug("Starting automatic priority adjustment")
+        
+        # Get execution stats from the plugin middleware
+        execution_stats = self._plugin_middleware.get_execution_stats()
+        
+        # Get configuration parameters for auto-adjustment
+        error_penalty = self.config.plugin_error_penalty
+        usage_boost = self.config.plugin_usage_boost
+        min_priority = self.config.plugin_min_priority
+        max_priority = self.config.plugin_max_priority
+        
+        adjustments_made = 0
+        
+        for plugin in self._plugin_manager.all_plugins:
+            plugin_name = plugin.metadata().name
+            current_priority = plugin.effective_priority()
+            stats = execution_stats.get(plugin_name, {
+                'execution_count': 0,
+                'error_count': 0,
+                'total_duration': 0.0,
+                'last_execution': 0.0,
+                'success_count': 0
+            })
+            
+            if stats['execution_count'] == 0:
+                # No usage data, skip adjustment
+                continue
+                
+            # Calculate adjustment based on error rate
+            error_rate = stats['error_count'] / stats['execution_count']
+            error_adjustment = int(error_rate * error_penalty * 10)  # Scale for visibility
+            
+            # Calculate adjustment based on usage frequency
+            # Simple frequency calculation - more executions = higher priority
+            usage_frequency = stats['execution_count'] / max(1, stats.get('execution_count', 1))
+            usage_adjustment = int(usage_frequency * usage_boost)
+            
+            # Calculate new priority
+            new_priority = current_priority + error_adjustment - usage_adjustment
+            
+            # Apply bounds
+            new_priority = max(min_priority, min(max_priority, new_priority))
+            
+             # Only adjust if there's a meaningful change
+            if abs(new_priority - current_priority) >= 2:  # Minimum 2-point change
+                plugin.set_runtime_priority(new_priority, self._plugin_context)
+                adjustments_made += 1
+                logger.info(
+                    "Auto-adjusted plugin priority",
+                    extra={
+                        "plugin_name": plugin_name,
+                        "old_priority": current_priority,
+                        "new_priority": new_priority,
+                        "error_rate": error_rate,
+                        "usage_frequency": usage_frequency
+                    }
+                )
+        
+        logger.debug("Automatic priority adjustment completed", extra={"adjustments_made": adjustments_made})
+    
+    async def _auto_adjust_priorities_async(self) -> None:
+        """Async wrapper for auto-adjusting priorities."""
+        await asyncio.to_thread(self._auto_adjust_priorities)
 
     def set_tool_permission(
         self, tool_name: str, permission: ToolPermission, save_permanently: bool = False
@@ -847,6 +873,14 @@ class AgentLoop:
         except Exception as exc:
             error_msg = f"Error getting tool '{tool_call.tool_name}': {exc}"
             logger.exception(error_msg)
+            
+            # Track failed plugin tool usage if this tool was from a plugin
+            plugin_name = self.tool_manager.get_plugin_for_tool(tool_call.tool_name)
+            if plugin_name:
+                self._plugin_manager.track_plugin_tool_call(plugin_name, tool_call.tool_name, False, 0.0)
+                logger.debug("Tracked failed tool call: plugin='%s', tool='%s', error=%s", 
+                           plugin_name, tool_call.tool_name, exc)
+            
             yield self._tool_failure_event(tool_call, error_msg, span=span)
             return
 
@@ -900,6 +934,12 @@ class AgentLoop:
 
             # Execute the tool through _execute_tool (triggers plugin hooks)
             logger.debug("About to call _execute_tool for %s", tool_call.tool_name)
+            
+            # Track plugin tool usage if this tool was contributed by a plugin
+            plugin_name = self.tool_manager.get_plugin_for_tool(tool_call.tool_name)
+            if plugin_name:
+                logger.debug("Tool '%s' is from plugin '%s', tracking usage", tool_call.tool_name, plugin_name)
+            
             text_result = await self._execute_tool(
                 tool_call.tool_name, tool_call.args_dict, invoke_ctx
             )
@@ -935,6 +975,16 @@ class AgentLoop:
             extra = tool_instance.get_result_extra(result_model)
             if extra:
                 text += "\n\n" + extra
+            
+            # Track successful plugin tool usage
+            if plugin_name:
+                tool_execution_time = time.perf_counter() - start_time
+                self._plugin_manager.track_plugin_tool_call(
+                    plugin_name, tool_call.tool_name, True, tool_execution_time
+                )
+                logger.debug("Tracked successful tool call: plugin='%s', tool='%s', time=%.3fs", 
+                           plugin_name, tool_call.tool_name, tool_execution_time)
+            
             self._handle_tool_response(
                 tool_call, text, "success", decision, result_dict, span=span
             )

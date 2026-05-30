@@ -94,6 +94,7 @@ class LspPlugin(ToolEventPlugin):
         )
 
     def __init__(self) -> None:
+        super().__init__()
         self._clients: dict[str, LspClient] = {}
         self._detected_languages: set[str] = set()
         self._context: PluginContext | None = None
@@ -292,7 +293,7 @@ class LspPlugin(ToolEventPlugin):
         )
         try:
             for tool in tools:
-                tm.register_dynamic_tool_instance(tool)
+                tm.register_dynamic_tool_instance(tool, "lsp")
             logger.debug("LSP plugin: registered %d tools into ToolManager", len(tools))
         except Exception as exc:
             logger.warning(

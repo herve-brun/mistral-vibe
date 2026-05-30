@@ -99,7 +99,7 @@ class TestPluginCircuitListener:
     @pytest.fixture
     def listener(self) -> PluginCircuitListener:
         """Create a test listener instance."""
-        return PluginCircuitListener("test_breaker")
+        return PluginCircuitListener("test_breaker", plugin_name="test_plugin", file_path="test.py", line_number=42)
 
     def test_listener_is_callable(self, listener) -> None:
         """Test that listener is callable (implements __call__)."""
@@ -132,6 +132,45 @@ class TestPluginCircuitListener:
         mock_breaker.current_state = "half-open"
 
         listener(mock_breaker, None)
+
+    def test_listener_includes_context_in_logs(self, listener) -> None:
+        """Test that listener includes context information in logs."""
+        import logging
+        from unittest.mock import patch
+        
+        mock_breaker = MagicMock()
+        mock_breaker.current_state = "open"
+        mock_exc = Exception("test error")
+
+        # Test with exception
+        with patch('vibe.core.plugins.resilience.logger') as mock_logger:
+            listener(mock_breaker, mock_exc)
+            
+            # Verify error call includes context
+            mock_logger.error.assert_called_once()
+            error_call_args = mock_logger.error.call_args
+            assert 'extra' in error_call_args.kwargs
+            assert 'context' in error_call_args.kwargs['extra']
+            context = error_call_args.kwargs['extra']['context']
+            assert context['circuit_name'] == 'test_breaker'
+            assert context['plugin_name'] == 'test_plugin'
+            assert context['file_path'] == 'test.py'
+            assert context['line_number'] == 42
+
+        # Test with state change
+        with patch('vibe.core.plugins.resilience.logger') as mock_logger:
+            listener(mock_breaker, None)
+            
+            # Verify warning call includes context
+            mock_logger.warning.assert_called_once()
+            warning_call_args = mock_logger.warning.call_args
+            assert 'extra' in warning_call_args.kwargs
+            assert 'context' in warning_call_args.kwargs['extra']
+            context = warning_call_args.kwargs['extra']['context']
+            assert context['circuit_name'] == 'test_breaker'
+            assert context['plugin_name'] == 'test_plugin'
+            assert context['file_path'] == 'test.py'
+            assert context['line_number'] == 42
 
 
 class TestExtensionPointSystem:

@@ -118,12 +118,22 @@ class CommandRegistry:
                 description="Rewind to a previous message",
                 handler="_start_rewind_mode",
             ),
-            "data-retention": Command(
-                aliases=frozenset(["/data-retention"]),
-                description="Show data retention information",
-                handler="_show_data_retention",
+             "data-retention": Command(
+                 aliases=frozenset(["/data-retention"]),
+                 description="Show data retention information",
+                 handler="_show_data_retention",
+             ),
+             "adjust-priority": Command(
+                  aliases=frozenset(["/adjust-priority"]),
+                  description="Adjust plugin priority (usage: /adjust-priority <plugin_name> <priority>)",
+                  handler="_adjust_plugin_priority",
+              ),
+            "plugin-stats": Command(
+                aliases=frozenset(["/plugin-stats"]),
+                description="Display plugin usage statistics",
+                handler="_show_plugin_stats",
             ),
-        }
+         }
 
         for command in excluded_commands:
             self.commands.pop(command, None)

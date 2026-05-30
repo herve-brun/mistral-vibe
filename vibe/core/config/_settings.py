@@ -23,7 +23,15 @@ from pydantic_settings import (
     PydanticBaseSettingsSource,
     SettingsConfigDict,
 )
-from pydantic_settings.sources.base import deep_update
+def deep_update(base: dict, updates: dict) -> dict:
+    """Deep update a dictionary with another dictionary."""
+    result = base.copy()
+    for key, value in updates.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_update(result[key], value)
+        else:
+            result[key] = value
+    return result
 import tomli_w
 
 from vibe.core.config.harness_files import get_harness_files_manager
@@ -647,6 +655,115 @@ class VibeConfig(BaseSettings):
         default=30.0,
         gt=0,
         description="Recovery timeout",
+    )
+    plugin_capabilities_required: list[str] = Field(
+        default_factory=list,
+        description=(
+            "List of capabilities that plugins must provide to be loaded. "
+            "If set, only plugins with at least one of these capabilities will be active."
+        ),
+    )
+    plugin_capabilities_excluded: list[str] = Field(
+        default_factory=list,
+        description=(
+            "List of capabilities that will prevent plugins from loading. "
+            "Plugins with any of these capabilities will be excluded."
+        ),
+    )
+    dynamic_priorities: bool = Field(
+        default=False,
+        description="Enable dynamic priority adjustment for plugins",
+    )
+    plugin_error_penalty: int = Field(
+        default=10,
+        ge=1,
+        description="Priority penalty multiplier for plugins with errors",
+    )
+    plugin_usage_boost: int = Field(
+        default=5,
+        ge=1,
+        description="Priority boost multiplier for frequently used plugins",
+    )
+    plugin_min_priority: int = Field(
+        default=10,
+        ge=0,
+        description="Minimum priority value for auto-adjustment",
+    )
+    plugin_max_priority: int = Field(
+        default=200,
+        ge=1,
+        description="Maximum priority value for auto-adjustment",
+    )
+    plugin_sandbox_enabled: bool = Field(
+        default=True,
+        description="Enable plugin sandboxing for process isolation and resource limits.",
+    )
+    plugin_sandbox_timeout_sec: float = Field(
+        default=10.0,
+        gt=0,
+        description="Timeout for plugin execution in the sandbox.",
+    )
+    plugin_sandbox_memory_limit_mb: int = Field(
+        default=100,
+        gt=0,
+        description="Maximum memory usage for plugins in the sandbox (in MB).",
+    )
+    plugin_sandbox_cpu_limit: float = Field(
+        default=1.0,
+        gt=0,
+        description="Maximum CPU usage for plugins in the sandbox (as a percentage of total CPU or core count).",
+    )
+    plugin_sandbox_filesystem_access: str = Field(
+        default="sandbox",
+        description="Filesystem access mode: 'sandbox' (restricted to sandbox dir), 'read_only' (read-only access), or 'full' (unrestricted).",
+    )
+    plugin_sandbox_directory: str = Field(
+        default="~/.vibe/plugin_sandbox",
+        description="Designated sandbox directory for plugin filesystem access.",
+    )
+    plugin_sandbox_network_access: bool = Field(
+        default=False,
+        description="Allow network access for plugins in the sandbox.",
+    )
+    plugin_sandbox_allowed_network_hosts: list[str] = Field(
+        default_factory=list,
+        description="List of allowed network hosts for plugins when network access is restricted.",
+    )
+    plugin_sandbox_system_calls: str = Field(
+        default="restricted",
+        description="System call policy: 'restricted' (limited syscalls), 'permissive' (most syscalls allowed), or 'custom' (custom policy).",
+    )
+    plugin_sandbox_custom_syscalls: list[str] = Field(
+        default_factory=list,
+        description="Custom list of allowed system calls when system_calls is set to 'custom'.",
+    )
+    plugin_sandbox_security_enabled: bool = Field(
+        default=True,
+        description="Enable enhanced security measures for plugin sandboxing.",
+    )
+
+    # Error reporting configuration
+    error_reporting_enabled: bool = Field(
+        default=True,
+        description="Enable enhanced error reporting.",
+    )
+    error_reporting_log_level: str = Field(
+        default="ERROR",
+        description="Log level for error reporting (DEBUG, INFO, WARNING, ERROR, CRITICAL).",
+    )
+    error_reporting_max_context_depth: int = Field(
+        default=5,
+        ge=1,
+        description="Maximum depth for error context information.",
+    )
+    error_reporting_include_stack_trace: bool = Field(
+        default=True,
+        description="Include stack traces in error reports.",
+    )
+    # Plugin reset configuration
+    plugin_reset_log_level: str = Field(
+        default="WARNING",
+        description="Log level for plugin reset operations (DEBUG, INFO, WARNING, ERROR, CRITICAL). Non-critical reset errors below this level will be suppressed.",
     )
 
     model_config = SettingsConfigDict(

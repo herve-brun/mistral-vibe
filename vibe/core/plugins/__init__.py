@@ -11,10 +11,14 @@ from vibe.core.plugins.base import (
     ToolEventPlugin,
     VibePlugin,
 )
+from vibe.core.plugins.context_aware import ContextAwarePlugin
 from vibe.core.plugins.manager import PluginManager
 from vibe.core.plugins.middleware import PluginMiddleware
+from vibe.core.plugins.registry import CapabilityRegistry
 
 __all__ = [
+    "CapabilityRegistry",
+    "ContextAwarePlugin",
     "PluginContext",
     "PluginManager",
     "PluginMetadata",

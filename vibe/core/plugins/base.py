@@ -35,7 +35,9 @@ Usage in a plugin module::
 from __future__ import annotations
 
 import abc
+import re
 from dataclasses import dataclass, field
+from enum import IntEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -46,6 +48,22 @@ if TYPE_CHECKING:
 
 # Hook implementation marker for pluggy
 hookimpl = pluggy.HookimplMarker("mistral-vibe")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Priority Groups
+# ──────────────────────────────────────────────────────────────────────────────
+
+class PriorityGroup(IntEnum):
+    """Priority groups for dynamic plugin ordering.
+
+    Lower values run first. These groups provide semantic meaning to priority ranges.
+    """
+    CRITICAL = 25      # 0-49: Critical system plugins
+    HIGH = 75          # 50-99: High-priority middleware  
+    DEFAULT = 100      # 90-110: Default range for most plugins
+    LOW = 175          # 150-199: Lower priority
+    DELAYED = 250      # 200+: Delayed execution
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -65,12 +83,21 @@ class PluginMetadata:
 
         - 0-49:   Critical system plugins (run first)
         - 50-99:  High-priority middleware
-        - 100:    Default for most plugins
+        - 90-110: Default range for most plugins
         - 150-199: Lower priority (run later)
         - 200+:   Delayed execution (run last)
     tags:
         Capability tags for filtering and discovery (e.g., ["code-lint",
         "telemetry"]). Empty by default.
+    capabilities:
+        List of capabilities provided by this plugin (e.g., ["file-system",
+        "network-access"]). Empty by default.
+    required_capabilities:
+        List of capabilities required by this plugin to function properly.
+        Empty by default.
+    runtime_requirements:
+        Dictionary of runtime requirements (e.g., {"python": ">=3.12"}).
+        Empty by default.
     """
 
     name: str
@@ -79,7 +106,89 @@ class PluginMetadata:
     author: str = ""
     provides_tools: list[str] = field(default_factory=list)
     priority: int = field(default=100)
+    priority_group: PriorityGroup | None = field(default=None)
     tags: list[str] = field(default_factory=list)
+    capabilities: list[str] = field(default_factory=list)
+    required_capabilities: list[str] = field(default_factory=list)
+    runtime_requirements: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Validate priority ranges and capability names after initialization."""
+        self._validate_priority()
+        self._validate_capability_names()
+
+    def _validate_priority(self) -> None:
+        """Validate that priority is within allowed ranges."""
+        # Get priority group ranges
+        priority_group_ranges = {
+            PriorityGroup.CRITICAL: (0, 49),
+            PriorityGroup.HIGH: (50, 99),
+            PriorityGroup.DEFAULT: (90, 110),
+            PriorityGroup.LOW: (150, 199),
+            PriorityGroup.DELAYED: (200, float('inf')),
+        }
+
+        # Check if priority_group is set and validate against its range
+        if self.priority_group is not None:
+            min_priority, max_priority = priority_group_ranges[self.priority_group]
+            if max_priority == float('inf'):
+                # Special case for DELAYED group - only check minimum
+                if self.priority < min_priority:
+                    raise ValueError(
+                        f"Priority {self.priority} is below the minimum valid value "
+                        f"{min_priority} for priority group {self.priority_group.name}"
+                    )
+            else:
+                # Check both min and max for other groups
+                if not (min_priority <= self.priority <= max_priority):
+                    raise ValueError(
+                        f"Priority {self.priority} is not within the valid range "
+                        f"{min_priority}-{max_priority} for priority group {self.priority_group.name}"
+                    )
+
+        # Validate against global min/max from configuration
+        # These are soft limits that can be overridden but provide guidance
+        plugin_min_priority = 0  # Allow 0 for critical system plugins
+        plugin_max_priority = 1000  # Allow higher values for special cases
+         
+        if self.priority < plugin_min_priority:
+            raise ValueError(
+                f"Priority {self.priority} is below the minimum allowed value of "
+                f"{plugin_min_priority}. Consider using a higher priority value."
+            )
+         
+        if self.priority > plugin_max_priority:
+            raise ValueError(
+                f"Priority {self.priority} is above the maximum allowed value of "
+                f"{plugin_max_priority}. Consider using a lower priority value."
+            )
+
+    def _validate_capability_names(self) -> None:
+        """Validate that capability names follow the kebab-case naming convention.
+        
+        Allowed characters: lowercase letters, numbers, hyphens, and underscores.
+        """
+        # Define the regex pattern for valid capability names
+        # kebab-case: lowercase letters, numbers, hyphens, and underscores
+        capability_pattern = re.compile(r'^[a-z0-9_-]+$')
+        
+        # Validate capabilities
+        for capability in self.capabilities:
+            if not capability_pattern.match(capability):
+                raise ValueError(
+                    f"Invalid capability name '{capability}'. "
+                    f"Capability names must use kebab-case: lowercase letters, numbers, "
+                    f"hyphens, and underscores only."
+                )
+        
+        # Validate required_capabilities
+        for capability in self.required_capabilities:
+            if not capability_pattern.match(capability):
+                raise ValueError(
+                    f"Invalid required capability name '{capability}'. "
+                    f"Capability names must use kebab-case: lowercase letters, numbers, "
+                    f"hyphens, and underscores only."
+                )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -123,6 +232,9 @@ class VibePlugin(abc.ABC):
     for the duration of the Vibe session.
     """
 
+    def __init__(self) -> None:
+        self._runtime_priority: int | None = None
+
     @classmethod
     @abc.abstractmethod
     def metadata(cls) -> PluginMetadata:
@@ -151,6 +263,82 @@ class VibePlugin(abc.ABC):
         present in the workdir).
         """
         return True
+
+    def set_runtime_priority(self, priority: int, context: PluginContext | None = None) -> None:
+        """Set a runtime priority override for this plugin.
+
+        This allows dynamic adjustment of plugin execution order based on
+        context, user preferences, or other runtime conditions.
+
+        Parameters
+        ----------
+        priority:
+            The new priority value. Lower values run first.
+        context:
+            Optional plugin context providing access to configuration.
+            If not provided, bounds checking will be skipped.
+
+        Raises
+        ------
+        ValueError
+            If priority is outside the configured bounds and context is provided.
+        """
+        old_priority = self._runtime_priority if self._runtime_priority is not None else self.metadata().priority
+        
+        self._validate_runtime_priority(priority, context)
+        self._runtime_priority = priority
+
+    def _validate_runtime_priority(self, priority: int, context: PluginContext | None = None) -> None:
+        """Validate runtime priority against allowed ranges."""
+        # Get priority group ranges from static metadata
+        metadata = self.metadata()
+        priority_group_ranges = {
+            PriorityGroup.CRITICAL: (0, 49),
+            PriorityGroup.HIGH: (50, 99),
+            PriorityGroup.DEFAULT: (90, 110),
+            PriorityGroup.LOW: (150, 199),
+            PriorityGroup.DELAYED: (200, float('inf')),
+        }
+
+        # Validate against global min/max from configuration first (if context is available)
+        if context is not None:
+            config = context.config
+            min_priority = config.plugin_min_priority
+            max_priority = config.plugin_max_priority
+
+            if priority < min_priority or priority > max_priority:
+                raise ValueError(
+                    f"Runtime priority {priority} is out of bounds. "
+                    f"Must be between {min_priority} and {max_priority} (inclusive)."
+                )
+
+        # If priority_group is set in metadata, validate against its range
+        if metadata.priority_group is not None:
+            min_priority, max_priority = priority_group_ranges[metadata.priority_group]
+            if max_priority == float('inf'):
+                # Special case for DELAYED group - only check minimum
+                if priority < min_priority:
+                    raise ValueError(
+                        f"Runtime priority {priority} is below the minimum valid value "
+                        f"{min_priority} for priority group {metadata.priority_group.name}"
+                    )
+            else:
+                # Check both min and max for other groups
+                if not (min_priority <= priority <= max_priority):
+                    raise ValueError(
+                        f"Runtime priority {priority} is not within the valid range "
+                        f"{min_priority}-{max_priority} for priority group {metadata.priority_group.name}"
+                    )
+
+    def clear_runtime_priority(self) -> None:
+        """Clear any runtime priority override, reverting to the static priority."""
+        self._runtime_priority = None
+
+    def effective_priority(self) -> int:
+        """Return the effective priority (runtime override or static priority)."""
+        if self._runtime_priority is not None:
+            return self._runtime_priority
+        return self.metadata().priority
 
 
 # ──────────────────────────────────────────────────────────────────────────────

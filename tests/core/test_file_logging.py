@@ -10,9 +10,10 @@ import pytest
 
 from vibe.core.logger import (
     StructuredLogFormatter,
-    apply_logging_config,
+    configure_structlog,
     decode_log_message,
     encode_log_message,
+    get_structured_logger,
 )
 
 
@@ -163,12 +164,17 @@ class TestApplyLoggingConfig:
         self, mock_log_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("LOG_LEVEL", "DEBUG")
-        test_logger = logging.getLogger("test_apply_logging")
-        initial_handler_count = len(test_logger.handlers)
-
-        apply_logging_config(test_logger)
-
-        assert len(test_logger.handlers) == initial_handler_count + 1
+        
+        # Configure structlog - this should set up the root logger
+        configure_structlog()
+        
+        # Get the root logger and check it has handlers
+        root_logger = logging.getLogger()
+        assert len(root_logger.handlers) >= 1
+        
+        # Test that we can get a structured logger
+        test_logger = get_structured_logger("test_apply_logging")
+        assert test_logger is not None
 
     def test_creates_log_file(
         self, mock_log_dir: Path, monkeypatch: pytest.MonkeyPatch
@@ -177,7 +183,7 @@ class TestApplyLoggingConfig:
         test_logger = logging.getLogger("test_log_file")
         test_logger.setLevel(logging.DEBUG)
 
-        apply_logging_config(test_logger)
+        configure_structlog()
         test_logger.info("Test log entry")
 
         log_file = mock_log_dir / "vibe.log"
@@ -190,7 +196,7 @@ class TestApplyLoggingConfig:
         test_logger = logging.getLogger("test_format")
         test_logger.setLevel(logging.DEBUG)
 
-        apply_logging_config(test_logger)
+        configure_structlog()
         test_logger.warning("Test warning message")
 
         log_file = mock_log_dir / "vibe.log"
@@ -206,7 +212,7 @@ class TestApplyLoggingConfig:
         test_logger = logging.getLogger("test_level_filter")
         test_logger.setLevel(logging.DEBUG)
 
-        apply_logging_config(test_logger)
+        configure_structlog()
         test_logger.debug("Debug message")
         test_logger.info("Info message")
         test_logger.warning("Warning message")
@@ -233,9 +239,9 @@ class TestApplyLoggingConfig:
             monkeypatch.setenv("LOG_LEVEL", "DEBUG")
             test_logger = logging.getLogger("test_mkdir")
 
-            apply_logging_config(test_logger)
-
-            assert log_dir.exists()
+        configure_structlog()
+        
+        assert log_dir.exists()
 
     def test_debug_mode_overrides_log_level(
         self, mock_log_dir: Path, monkeypatch: pytest.MonkeyPatch
@@ -245,7 +251,7 @@ class TestApplyLoggingConfig:
         test_logger = logging.getLogger("test_debug_mode")
         test_logger.setLevel(logging.DEBUG)
 
-        apply_logging_config(test_logger)
+        configure_structlog()
         test_logger.debug("Debug message")
 
         log_file = mock_log_dir / "vibe.log"
@@ -260,7 +266,7 @@ class TestApplyLoggingConfig:
         test_logger = logging.getLogger("test_invalid_level")
         test_logger.setLevel(logging.DEBUG)
 
-        apply_logging_config(test_logger)
+        configure_structlog()
         test_logger.info("Info message")
         test_logger.warning("Warning message")
 
@@ -277,7 +283,7 @@ class TestApplyLoggingConfig:
         monkeypatch.setenv("LOG_LEVEL", "DEBUG")
         test_logger = logging.getLogger("test_max_bytes")
 
-        apply_logging_config(test_logger)
+        configure_structlog()
 
         # Verify handler was added with correct maxBytes
         handler = test_logger.handlers[-1]

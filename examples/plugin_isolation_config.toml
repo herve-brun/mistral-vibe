@@ -1,0 +1,19 @@
+
+[plugins]
+# Enable plugin isolation for security
+enable_isolation = true
+
+# Resource limits for plugins
+# cpu_limit = 1.0              # Maximum CPU usage (1.0 = 100% of a single core)
+# memory_limit = 512           # Maximum memory usage in MB
+# timeout = 30                # Maximum execution time in seconds
+
+# Plugin capability filtering
+# enabled_plugins = ["lsp", "hello"]
+# disabled_plugins = ["experimental"]
+
+# Plugin paths (in addition to built-ins)
+# plugin_paths = [
+#   "~/custom_plugins",
+#   "/opt/vibe/plugins"
+# ]
