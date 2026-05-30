@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 from vibe.core.config.harness_files import get_harness_files_manager
 from vibe.core.logger import logger
 from vibe.core.paths import DEFAULT_TOOL_DIR
-from vibe.core.tools.base import BaseTool, BaseToolConfig
+from vibe.core.tools.base import BaseTool, BaseToolConfig, ToolPermission
 from vibe.core.tools.connectors import ConnectorRegistry
 from vibe.core.tools.mcp import MCPRegistry
 from vibe.core.tools.mcp.tools import MCPTool
@@ -76,8 +76,10 @@ class ToolManager:
         connector_registry: ConnectorRegistry | None = None,
         *,
         defer_mcp: bool = False,
+        permission_getter: Callable[[str], ToolPermission | None] | None = None,
     ) -> None:
         self._config_getter = config_getter
+        self._permission_getter = permission_getter
         self._mcp_registry = mcp_registry or MCPRegistry()
         self._connector_registry = connector_registry
         self._instances: dict[str, BaseTool] = {}
@@ -198,7 +200,9 @@ class ToolManager:
     def available_tools(self) -> dict[str, type[BaseTool]]:
         with self._lock:
             runtime_available = {
-                name: cls for name, cls in self._available.items() if cls.is_available()
+                name: cls
+                for name, cls in self._available.items()
+                if self._is_tool_available(cls)
             }
 
         # Apply general tool filtering first
@@ -206,13 +210,13 @@ class ToolManager:
         if self._config.enabled_tools:
             filtered_by_general = {
                 name: cls
-                for name, cls in runtime_available.items()
+                for name, cls in result.items()
                 if name_matches(name, self._config.enabled_tools)
             }
         elif self._config.disabled_tools:
             filtered_by_general = {
                 name: cls
-                for name, cls in runtime_available.items()
+                for name, cls in result.items()
                 if not name_matches(name, self._config.disabled_tools)
             }
 
@@ -374,10 +378,15 @@ class ToolManager:
             default_config = BaseToolConfig()
 
         user_overrides = self._config.tools.get(tool_name)
-        if user_overrides is None:
+        permission_override = (
+            self._permission_getter(tool_name) if self._permission_getter else None
+        )
+        if user_overrides is None and permission_override is None:
             return config_class()
 
-        merged_dict = {**default_config.model_dump(), **user_overrides}
+        merged_dict = {**default_config.model_dump(), **(user_overrides or {})}
+        if permission_override is not None:
+            merged_dict["permission"] = permission_override.value
         return config_class.model_validate(merged_dict)
 
     def get(self, tool_name: str) -> BaseTool:

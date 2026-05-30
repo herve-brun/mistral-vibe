@@ -123,6 +123,22 @@ Use the `--agent` flag to select a different agent:
 vibe --agent plan
 ```
 
+To change the default agent used when `--agent` is not passed, set
+`default_agent` in your `config.toml`:
+
+```toml
+default_agent = "plan"
+```
+
+Valid values are `default`, `plan`, `accept-edits`, `auto-approve`,
+`lean` (only when listed in `installed_agents`), or the name of any
+custom agent file in `~/.vibe/agents/` or the project's `.vibe/agents/`
+directory. Subagents such as `explore` are not accepted.
+
+> Note: `default_agent` only applies to interactive sessions. In
+> programmatic mode (`-p` / `--prompt`), Vibe falls back to `auto-approve`
+> when `--agent` is not provided, so `default_agent` is ignored.
+
 ### Subagents and Task Delegation
 
 Vibe supports subagents for delegating tasks. Subagents run independently and can perform specialized work without user interaction, preventing the context from being overloaded.
@@ -219,15 +235,13 @@ Simply run `vibe` to enter the interactive chat loop.
 - **Tool Output Toggle**: Press `Ctrl+O` to toggle the tool output view.
 - **Todo View Toggle**: Press `Ctrl+T` to toggle the todo list view.
 - **Debug Console**: Press `Ctrl+\` to toggle the debug console.
-- **Auto-Approve Toggle**: Press `Shift+Tab` to toggle auto-approve mode on/off.
+- **Agent Selection**: Press `Shift+Tab` to cycle through agents (default, plan, ...).
 
 You can start Vibe with a prompt using the following command:
 
 ```bash
 vibe "Refactor the main function in cli/main.py to be more modular."
 ```
-
-**Note**: The `--auto-approve` flag automatically approves all tool executions without prompting. In interactive mode, you can also toggle auto-approve on/off using `Shift+Tab`.
 
 ### Trust Folder System
 
@@ -253,6 +267,7 @@ When using `--prompt`, you can specify additional options:
 
 - **`--max-turns N`**: Limit the maximum number of assistant turns. The session will stop after N turns.
 - **`--max-price DOLLARS`**: Set a maximum cost limit in dollars. The session will be interrupted if the cost exceeds this limit.
+- **`--max-tokens N`**: Set a maximum cumulative LLM token budget for the session, counting both prompt and completion tokens. The session will be interrupted if usage exceeds this limit.
 - **`--enabled-tools TOOL`**: Enable specific tools. In programmatic mode, this disables all other tools. Can be specified multiple times. Supports exact names, glob patterns (e.g., `bash*`), or regex with `re:` prefix (e.g., `re:^serena_.*$`).
 - **`--output FORMAT`**: Set the output format. Options:
   - `text` (default): Human-readable text output
@@ -262,7 +277,7 @@ When using `--prompt`, you can specify additional options:
 Example:
 
 ```bash
-vibe --prompt "Analyze the codebase" --max-turns 5 --max-price 1.0 --output json
+vibe --prompt "Analyze the codebase" --max-turns 5 --max-price 1.0 --max-tokens 50000 --output json
 ```
 
 ## Voice Mode
@@ -358,7 +373,7 @@ Vibe discovers skills from multiple locations:
 1. **Custom paths**: Configured in `config.toml` via `skill_paths`
 2. **Standard Agent Skills path** (project root, trusted folders only): `.agents/skills/` — [Agent Skills](https://agentskills.io) standard
 3. **Local project skills** (project root, trusted folders only): `.vibe/skills/` in your project
-4. **Global skills directory**: `~/.vibe/skills/`
+4. **Global skills directories**: `~/.vibe/skills/` and `~/.agents/skills/`
 
 ```toml
 skill_paths = ["/path/to/custom/skills"]
@@ -410,9 +425,27 @@ Vibe supports multiple ways to configure your API keys:
 
 **Note**: The `.env` file is specifically for API keys and other provider credentials. General Vibe configuration should be done in `config.toml`.
 
+### TLS and Corporate Certificate Authorities
+
+By default, Vibe uses the bundled `certifi` certificate roots for outbound HTTPS requests. If your organization installs private certificate authorities in the operating system trust store, you can opt in to the system trust store in `config.toml`:
+
+```toml
+enable_system_trust_store = true
+```
+
+`SSL_CERT_FILE` and `SSL_CERT_DIR` are still supported and are loaded as additional trust anchors.
+
 ### Custom System Prompts
 
-You can create custom system prompts to replace the default one (`prompts/cli.md`). Create a markdown file in the `~/.vibe/prompts/` directory with your custom prompt content.
+You can create `AGENTS.md` files to add custom instructions. You can also replace the entire system prompt.
+
+Place `AGENTS.md` files in:
+- `~/.vibe/AGENTS.md` — user-level instructions for all projects
+- Project directories — project-specific instructions, loaded from cwd up to the trust root
+
+Priority: closer directories override more distant ones. Instructions in `AGENTS.md` override the default system prompt. Files are only loaded for trusted folders.
+
+Custom system prompts entirely replace the default one (`prompts/cli.md`). Create a markdown file in the `~/.vibe/prompts/` directory with your custom prompt content.
 
 To use a custom system prompt, set the `system_prompt_id` in your configuration to match the filename (without the `.md` extension):
 
@@ -422,6 +455,21 @@ system_prompt_id = "my_custom_prompt"
 ```
 
 This will load the prompt from `~/.vibe/prompts/my_custom_prompt.md`.
+
+Project-local prompts in `.vibe/prompts/` are also supported and override user-level prompts with the same name. This applies to all custom prompts (system and compaction).
+
+### Custom Compaction Prompts
+
+Compaction uses the built-in prompt at `prompts/compact.md` by default. You can replace it with a custom prompt from `~/.vibe/prompts/` (or `.vibe/prompts/`) using the same resolution rules as system prompts.
+
+To use a custom compaction prompt, set `compaction_prompt_id` in your configuration to match the filename (without the `.md` extension):
+
+```toml
+# Use a custom compaction prompt
+compaction_prompt_id = "my_compaction_prompt"
+```
+
+Any extra instructions passed to `/compact ...` are appended after the configured compaction prompt.
 
 ### Custom Agent Configurations
 
@@ -439,7 +487,7 @@ Example custom agent configuration (`~/.vibe/agents/redteam.toml`):
 
 ```toml
 # Custom agent configuration for red-teaming
-active_model = "devstral-2"
+active_model = "mistral-medium-3.5"
 system_prompt_id = "redteam"
 
 # Disable some tools for this agent
@@ -585,6 +633,14 @@ vibe --workdir /path/to/project
 
 This is useful when you want to run Vibe from a different location than your current directory.
 
+Use `--add-dir` (repeatable) to make additional directories available to the agent for the duration of the session:
+
+```bash
+vibe --add-dir /path/to/other-project --add-dir /path/to/library
+```
+
+Each path is implicitly trusted (no trust prompt) and contributes its `AGENTS.md` and `.vibe/` configuration (tools, skills, agents, prompts, hooks) to the session. File-tool permissions treat each `--add-dir` path the same way as your primary working directory — reads and writes inside them don't require the "outside workdir" prompt. Nested paths collapse: passing `/repo` and `/repo/sub` is equivalent to passing just `/repo`.
+
 ### Update Settings
 
 #### Auto-Update
@@ -620,7 +676,7 @@ This affects where Vibe looks for:
 - `config.toml` - Main configuration
 - `.env` - API keys
 - `agents/` - Custom agent configurations
-- `prompts/` - Custom system prompts
+- `prompts/` - Custom system and compaction prompts
 - `tools/` - Custom tools
 - `logs/` - Session logs
 

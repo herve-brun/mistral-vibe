@@ -324,12 +324,6 @@ class AnthropicAdapter(APIAdapter):
         "prompt-caching-2024-07-31,"
         "context-1m-2025-08-07"
     )
-    THINKING_BUDGETS: ClassVar[dict[str, int]] = {
-        "low": 1024,
-        "medium": 10_000,
-        "high": 32_000,
-        "max": 128_000,
-    }
     DEFAULT_ADAPTIVE_MAX_TOKENS: ClassVar[int] = 32_768
     DEFAULT_MAX_TOKENS = 8192
 
@@ -375,17 +369,11 @@ class AnthropicAdapter(APIAdapter):
         if last_block.get("type") in {"text", "image", "tool_result"}:
             last_block["cache_control"] = {"type": "ephemeral"}
 
-    @staticmethod
-    def _is_adaptive_model(model_name: str) -> bool:
-        return "opus-4-6" in model_name
-
     def _apply_thinking_config(
         self,
         payload: dict[str, Any],
         *,
-        model_name: str,
         messages: list[dict[str, Any]],
-        temperature: float,
         max_tokens: int | None,
         thinking: str,
     ) -> None:
@@ -393,28 +381,20 @@ class AnthropicAdapter(APIAdapter):
         thinking_level = thinking
 
         if thinking_level == "off" and not has_thinking:
-            payload["temperature"] = temperature
-            if max_tokens is not None:
-                payload["max_tokens"] = max_tokens
-            else:
-                payload["max_tokens"] = self.DEFAULT_MAX_TOKENS
+            payload["max_tokens"] = (
+                max_tokens if max_tokens is not None else self.DEFAULT_MAX_TOKENS
+            )
             return
 
         # Resolve effective level: use config, or fallback to "medium" when
         # forced by thinking content in history
         effective_level = thinking_level if thinking_level != "off" else "medium"
 
-        if self._is_adaptive_model(model_name):
-            payload["thinking"] = {"type": "adaptive"}
-            payload["output_config"] = {"effort": effective_level}
-            default_max = self.DEFAULT_ADAPTIVE_MAX_TOKENS
-        else:
-            budget = self.THINKING_BUDGETS[effective_level]
-            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
-            default_max = budget + self.DEFAULT_MAX_TOKENS
-
-        payload["temperature"] = 1
-        payload["max_tokens"] = max_tokens if max_tokens is not None else default_max
+        payload["thinking"] = {"type": "adaptive", "display": "summarized"}
+        payload["output_config"] = {"effort": effective_level}
+        payload["max_tokens"] = (
+            max_tokens if max_tokens is not None else self.DEFAULT_ADAPTIVE_MAX_TOKENS
+        )
 
     def _build_payload(
         self,
@@ -422,7 +402,6 @@ class AnthropicAdapter(APIAdapter):
         model_name: str,
         system_prompt: str | None,
         messages: list[dict[str, Any]],
-        temperature: float,
         tools: list[dict[str, Any]] | None,
         max_tokens: int | None,
         tool_choice: dict[str, Any] | None,
@@ -432,12 +411,7 @@ class AnthropicAdapter(APIAdapter):
         payload: dict[str, Any] = {"model": model_name, "messages": messages}
 
         self._apply_thinking_config(
-            payload,
-            model_name=model_name,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            thinking=thinking,
+            payload, messages=messages, max_tokens=max_tokens, thinking=thinking
         )
 
         if system_blocks := self._build_system_blocks(system_prompt):
@@ -478,7 +452,6 @@ class AnthropicAdapter(APIAdapter):
             model_name=model_name,
             system_prompt=system_prompt,
             messages=converted_messages,
-            temperature=temperature,
             tools=converted_tools,
             max_tokens=max_tokens,
             tool_choice=converted_tool_choice,

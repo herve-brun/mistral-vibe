@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from vibe.cli.textual_ui.widgets.compact import CompactMessage
+from vibe.cli.textual_ui.widgets.loading import DEFAULT_LOADING_STATUS
 from vibe.cli.textual_ui.widgets.messages import (
     AssistantMessage,
+    HookRunContainer,
+    HookSystemMessageLine,
+    PlanFileMessage,
     ReasoningMessage,
     UserMessage,
 )
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from vibe.cli.textual_ui.widgets.tools import ToolCallMessage, ToolResultMessage
+from vibe.core.hooks.models import (
+    HookEndEvent,
+    HookEvent,
+    HookRunEndEvent,
+    HookRunStartEvent,
+    HookStartEvent,
+)
 from vibe.core.tools.ui import ToolUIDataAdapter
 from vibe.core.types import (
     AgentProfileChangedEvent,
@@ -18,7 +30,10 @@ from vibe.core.types import (
     BaseEvent,
     CompactEndEvent,
     CompactStartEvent,
+    PlanReviewEndedEvent,
+    PlanReviewRequestedEvent,
     ReasoningEvent,
+    SessionTitleUpdatedEvent,
     ToolCallEvent,
     ToolResultEvent,
     ToolStreamEvent,
@@ -47,12 +62,37 @@ class EventHandler:
         self.current_compact: CompactMessage | None = None
         self.current_streaming_message: AssistantMessage | None = None
         self.current_streaming_reasoning: ReasoningMessage | None = None
+        self.plan_file_message: PlanFileMessage | None = None
+        self._hook_run_container: HookRunContainer | None = None
 
-    async def handle_event(
-        self,
-        event: BaseEvent,
-        loading_active: bool = False,
-        loading_widget: LoadingWidget | None = None,
+    async def _handle_hook_event(
+        self, event: HookEvent, loading_widget: LoadingWidget | None = None
+    ) -> None:
+        match event:
+            case HookRunStartEvent():
+                self._hook_run_container = HookRunContainer()
+                await self.mount_callback(self._hook_run_container)
+            case HookRunEndEvent():
+                if self._hook_run_container and not self._hook_run_container.display:
+                    await self._hook_run_container.remove()
+                self._hook_run_container = None
+            case HookStartEvent():
+                await self.finalize_streaming()
+                if loading_widget:
+                    loading_widget.set_status(f"Running hook {event.hook_name}")
+            case HookEndEvent():
+                if event.content and self._hook_run_container is not None:
+                    widget = HookSystemMessageLine(
+                        hook_name=event.hook_name,
+                        content=event.content,
+                        severity=event.status,
+                    )
+                    await self._hook_run_container.add_message(widget)
+                if loading_widget:
+                    loading_widget.set_status(DEFAULT_LOADING_STATUS)
+
+    async def handle_event(  # noqa: PLR0912
+        self, event: BaseEvent, loading_widget: LoadingWidget | None = None
     ) -> ToolCallMessage | None:
         match event:
             case ReasoningEvent():
@@ -77,10 +117,18 @@ class EventHandler:
             case AgentProfileChangedEvent():
                 if self.on_profile_changed:
                     self.on_profile_changed()
+            case SessionTitleUpdatedEvent():
+                pass
             case UserMessageEvent():
                 await self.finalize_streaming()
                 if self.is_remote:
                     await self.mount_callback(UserMessage(event.content))
+            case HookEvent():
+                await self._handle_hook_event(event, loading_widget)
+            case PlanReviewRequestedEvent():
+                await self._handle_start_plan_review(file_path=event.file_path)
+            case PlanReviewEndedEvent():
+                self._handle_stop_plan_review()
             case WaitingForInputEvent():
                 await self.finalize_streaming()
             case _:
@@ -181,7 +229,7 @@ class EventHandler:
     async def _handle_compact_end(self, event: CompactEndEvent) -> None:
         if self.current_compact:
             self.current_compact.set_complete(
-                old_tokens=event.old_context_tokens, new_tokens=event.new_context_tokens
+                old_session_id=event.old_session_id, new_session_id=event.new_session_id
             )
             self.current_compact = None
 
@@ -206,3 +254,16 @@ class EventHandler:
         if self.current_compact:
             self.current_compact.stop_spinning(success=False)
             self.current_compact = None
+
+    async def _handle_start_plan_review(self, file_path: Path) -> None:
+        file_path.touch()
+        msg = PlanFileMessage(file_path=file_path)
+        self.plan_file_message = msg
+        await self.mount_callback(msg)
+
+    def _handle_stop_plan_review(self) -> None:
+        if self.plan_file_message is None:
+            return
+
+        self.plan_file_message.stop_watching()
+        self.plan_file_message = None

@@ -60,6 +60,26 @@ class TestCommandRegistry:
         assert registry.parse_command("/exit") is None
         assert registry.get_command_name("/help") == "help"
 
+    def test_teleport_command_hidden_without_eligible_context(self) -> None:
+        registry = CommandRegistry()
+        assert registry.get_command_name("/teleport") is None
+        assert registry.parse_command("/teleport") is None
+
+    def test_teleport_command_registration_uses_resolved_context(self) -> None:
+        registry = CommandRegistry(availability_context=_eligible_teleport_context())
+        assert registry.get_command_name("/teleport") == "teleport"
+        assert registry.has_command("teleport")
+
+    def test_teleport_help_text_uses_resolved_context(self) -> None:
+        registry = CommandRegistry()
+        assert "/teleport" not in registry.get_help_text()
+
+        eligible_registry = CommandRegistry(
+            availability_context=_eligible_teleport_context()
+        )
+        assert eligible_registry.get("teleport") is not None
+        assert "/teleport" in eligible_registry.get_help_text()
+
     def test_resume_command_registration(self) -> None:
         registry = CommandRegistry()
         assert registry.get_command_name("/resume") == "resume"
@@ -68,6 +88,16 @@ class TestCommandRegistry:
         assert result is not None
         _, cmd, _ = result
         assert cmd.handler == "_show_session_picker"
+
+    def test_rename_command_registration(self) -> None:
+        registry = CommandRegistry()
+        assert registry.get_command_name("/rename") == "rename"
+        assert registry.get_command_name("/title") is None
+        result = registry.parse_command("/rename Better title")
+        assert result is not None
+        _, cmd, cmd_args = result
+        assert cmd.handler == "_rename_session"
+        assert cmd_args == "Better title"
 
     def test_parse_command_keeps_args_for_no_arg_commands(self) -> None:
         registry = CommandRegistry()

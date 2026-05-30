@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any, ClassVar, Literal
 
 from textual import events
@@ -8,6 +9,7 @@ from textual.message import Message
 from textual.widgets import TextArea
 
 from vibe.cli.autocompletion.base import CompletionResult
+from vibe.cli.commands import CommandRegistry
 from vibe.cli.textual_ui.external_editor import ExternalEditor
 from vibe.cli.textual_ui.widgets.chat_input.completion_manager import (
     MultiCompletionManager,
@@ -59,12 +61,12 @@ class ChatTextArea(TextArea):
 
     def __init__(
         self,
-        nuage_enabled: bool = False,
+        command_registry: CommandRegistry,
         voice_manager: VoiceManagerPort | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        self._nuage_enabled = nuage_enabled
+        self._command_registry = command_registry
         self._input_mode: InputMode = self.DEFAULT_MODE
         self._last_text = ""
         self._navigating_history = False
@@ -74,6 +76,7 @@ class ChatTextArea(TextArea):
         self._completion_manager: MultiCompletionManager | None = None
         self._app_has_focus: bool = True
         self._voice_manager = voice_manager
+        self._last_keystroke_time: float = 0.0
 
     def on_blur(self, event: events.Blur) -> None:
         if self._app_has_focus:
@@ -136,8 +139,15 @@ class ChatTextArea(TextArea):
         )
 
         if should_intercept:
-            self._navigating_history = True
-            self.post_message(self.HistoryPrevious())
+            if (
+                self.text
+                and self.cursor_location != (0, 0)
+                and not history_loaded_and_cursor_unmoved
+            ):
+                self.move_cursor((0, 0))
+            else:
+                self._navigating_history = True
+                self.post_message(self.HistoryPrevious())
             return True
         return False
 
@@ -197,7 +207,12 @@ class ChatTextArea(TextArea):
 
         return False
 
+    def time_since_last_keystroke(self) -> float:
+        return time.monotonic() - self._last_keystroke_time
+
     async def _on_key(self, event: events.Key) -> None:  # noqa: PLR0911
+        self._last_keystroke_time = time.monotonic()
+
         if await self._handle_voice_key(event):
             return
 
@@ -365,7 +380,7 @@ class ChatTextArea(TextArea):
     @property
     def mode_characters(self) -> set[InputMode]:
         chars: set[InputMode] = {"!", "/"}
-        if self._nuage_enabled:
+        if self._command_registry.has_command("teleport"):
             chars.add("&")
         return chars
 

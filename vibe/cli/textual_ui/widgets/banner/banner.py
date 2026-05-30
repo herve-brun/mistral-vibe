@@ -13,24 +13,20 @@ from vibe.cli.textual_ui.widgets.banner.petit_chat import PetitChat
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from vibe.core.config import VibeConfig
 from vibe.core.skills.manager import SkillManager
-from vibe.core.tools.connectors import ConnectorRegistry
-from vibe.core.tools.mcp.registry import MCPRegistry
 
 
 def _pluralize(count: int, singular: str) -> str:
     return f"{count} {singular}{'s' if count != 1 else ''}"
 
 
-def _connector_count(registry: ConnectorRegistry | None) -> int:
-    return registry.connector_count if registry else 0
-
-
 @dataclass
 class BannerState:
     active_model: str = ""
     models_count: int = 0
-    mcp_servers_count: int = 0
-    connectors_count: int = 0
+    mcp_servers_enabled: int = 0
+    mcp_servers_total: int = 0
+    connectors_enabled: int = 0
+    connectors_total: int = 0
     skills_count: int = 0
     plugins_count: int = 0
     plan_description: str | None = None
@@ -43,8 +39,8 @@ class Banner(Static):
         self,
         config: VibeConfig,
         skill_manager: SkillManager,
-        mcp_registry: MCPRegistry,
-        connector_registry: ConnectorRegistry | None = None,
+        connectors_enabled: int = 0,
+        connectors_total: int = 0,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -103,11 +99,33 @@ class Banner(Static):
         plugin_manager: Any = None,
         plan_description: str | None = None,
     ) -> None:
-        self.state = BannerState(
-            active_model=config.active_model,
+        self.state = self._build_state(
+            config,
+            skill_manager,
+            connectors_enabled,
+            connectors_total,
+            plan_description,
+        )
+
+    @staticmethod
+    def _build_state(
+        config: VibeConfig,
+        skill_manager: SkillManager,
+        connectors_enabled: int = 0,
+        connectors_total: int = 0,
+        plan_description: str | None = None,
+    ) -> BannerState:
+        all_servers = config.mcp_servers
+        enabled_servers = [s for s in all_servers if not s.disabled]
+
+        active_model = config.get_active_model()
+        return BannerState(
+            active_model=f"{active_model.alias}[{active_model.thinking}]",
             models_count=len(config.models),
-            mcp_servers_count=mcp_registry.count_loaded(config.mcp_servers),
-            connectors_count=_connector_count(connector_registry),
+            mcp_servers_enabled=len(enabled_servers),
+            mcp_servers_total=len(all_servers),
+            connectors_enabled=connectors_enabled,
+            connectors_total=connectors_total,
             skills_count=skill_manager.custom_skills_count,
             plugins_count=len(plugin_manager.all_plugins) if plugin_manager else 0,
             plan_description=plan_description,
@@ -115,9 +133,25 @@ class Banner(Static):
 
     def _format_meta_counts(self) -> str:
         parts = [_pluralize(self.state.models_count, "model")]
-        if self.state.connectors_count > 0:
-            parts.append(_pluralize(self.state.connectors_count, "connector"))
-        parts.append(_pluralize(self.state.mcp_servers_count, "MCP server"))
+        # Format as x/y for MCP servers and connectors (only when enabled != total)
+        if self.state.connectors_total > 0:
+            if self.state.connectors_enabled != self.state.connectors_total:
+                connector_str = (
+                    f"{self.state.connectors_enabled}/{self.state.connectors_total} connector"
+                    + ("s" if self.state.connectors_total != 1 else "")
+                )
+            else:
+                connector_str = _pluralize(self.state.connectors_enabled, "connector")
+            parts.append(connector_str)
+        # Always show MCP servers count (even if 0/0)
+        if self.state.mcp_servers_enabled != self.state.mcp_servers_total:
+            mcp_str = (
+                f"{self.state.mcp_servers_enabled}/{self.state.mcp_servers_total} MCP server"
+                + ("s" if self.state.mcp_servers_total != 1 else "")
+            )
+        else:
+            mcp_str = _pluralize(self.state.mcp_servers_enabled, "MCP server")
+        parts.append(mcp_str)
         parts.append(_pluralize(self.state.skills_count, "skill"))
         parts.append(_pluralize(self.state.plugins_count, "plugin"))
         return " · ".join(parts)

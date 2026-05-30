@@ -10,9 +10,9 @@ import httpx
 
 from vibe.core.llm.backend.anthropic import AnthropicAdapter
 from vibe.core.llm.backend.base import APIAdapter, PreparedRequest
+from vibe.core.llm.backend.openai_responses import OpenAIResponsesAdapter
 from vibe.core.llm.backend.reasoning_adapter import ReasoningAdapter
 from vibe.core.llm.exceptions import BackendErrorBuilder
-from vibe.core.llm.message_utils import merge_consecutive_user_messages
 from vibe.core.types import (
     AvailableTool,
     LLMChunk,
@@ -22,6 +22,7 @@ from vibe.core.types import (
     StrToolChoice,
 )
 from vibe.core.utils import async_generator_retry, async_retry
+from vibe.core.utils.http import build_ssl_context
 
 if TYPE_CHECKING:
     from vibe.core.config import ModelConfig, ProviderConfig
@@ -92,17 +93,21 @@ class OpenAIAdapter(APIAdapter):
         api_key: str | None = None,
         thinking: str = "off",
     ) -> PreparedRequest:
-        merged_messages = merge_consecutive_user_messages(messages)
         field_name = provider.reasoning_field_name
         converted_messages = [
             self._reasoning_to_api(
                 msg.model_dump(
                     exclude_none=True,
-                    exclude={"message_id", "reasoning_message_id", "injected"},
+                    exclude={
+                        "message_id",
+                        "reasoning_message_id",
+                        "reasoning_state",
+                        "injected",
+                    },
                 ),
                 field_name,
             )
-            for msg in merged_messages
+            for msg in messages
         ]
 
         payload = self.build_payload(
@@ -167,9 +172,9 @@ _ADAPTERS: dict[str, APIAdapter] = {
 
 
 def _get_adapter(api_style: str) -> APIAdapter:
-    """Loads the appropriate adapter for the given API style,
-    lazily if the adapter is not already loaded.
-    """
+    """Load the adapter for the given API style."""
+    if api_style == "openai-responses":
+        return OpenAIResponsesAdapter()
     if api_style not in _ADAPTERS:
         if api_style == "vertex-anthropic":
             from vibe.core.llm.backend.vertex import VertexAnthropicAdapter
@@ -203,6 +208,7 @@ class GenericBackend:
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self._timeout),
                 limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+                verify=build_ssl_context(),
             )
         return self
 
@@ -221,6 +227,7 @@ class GenericBackend:
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self._timeout),
                 limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+                verify=build_ssl_context(),
             )
             self._owns_client = True
         return self._client
@@ -408,35 +415,6 @@ class GenericBackend:
                 if value == "[DONE]":
                     return
                 yield json.loads(value.strip())
-
-    async def count_tokens(
-        self,
-        *,
-        model: ModelConfig,
-        messages: Sequence[LLMMessage],
-        temperature: float = 0.0,
-        tools: list[AvailableTool] | None = None,
-        tool_choice: StrToolChoice | AvailableTool | None = None,
-        extra_headers: dict[str, str] | None = None,
-        metadata: dict[str, str] | None = None,
-    ) -> int:
-        probe_messages = list(messages)
-        if not probe_messages or probe_messages[-1].role != Role.user:
-            probe_messages.append(LLMMessage(role=Role.user, content=""))
-
-        result = await self.complete(
-            model=model,
-            messages=probe_messages,
-            temperature=temperature,
-            tools=tools,
-            max_tokens=16,  # Minimal amount for openrouter with openai models
-            tool_choice=tool_choice,
-            extra_headers=extra_headers,
-        )
-        if result.usage is None:
-            raise ValueError("Missing usage in non streaming completion")
-
-        return result.usage.prompt_tokens
 
     async def close(self) -> None:
         if self._owns_client and self._client:

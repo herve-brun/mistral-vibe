@@ -54,9 +54,7 @@ def acp_write_file_tool(
     monkeypatch.chdir(tmp_path)
     config = WriteFileConfig()
     state = AcpWriteFileState.model_construct(
-        client=mock_client,
-        session_id="test_session_123",
-        tool_call_id="test_tool_call_456",
+        client=mock_client, session_id="test_session_123"
     )
     return WriteFile(config_getter=lambda: config, state=state)
 
@@ -81,7 +79,6 @@ class TestAcpWriteFileExecution:
         assert result.bytes_written == len(b"Hello, world!")
         assert result.file_existed is False
         assert mock_client._write_text_file_called
-        assert mock_client._session_update_called
 
         # Verify write_text_file was called correctly
         params = mock_client._last_write_params
@@ -97,7 +94,7 @@ class TestAcpWriteFileExecution:
         tool = WriteFile(
             config_getter=lambda: WriteFileConfig(),
             state=AcpWriteFileState.model_construct(
-                client=mock_client, session_id="test_session", tool_call_id="test_call"
+                client=mock_client, session_id="test_session"
             ),
         )
 
@@ -114,13 +111,67 @@ class TestAcpWriteFileExecution:
         assert result.bytes_written == len(b"New content")
         assert result.file_existed is True
         assert mock_client._write_text_file_called
-        assert mock_client._session_update_called
 
         # Verify write_text_file was called correctly
         params = mock_client._last_write_params
         assert params["session_id"] == "test_session"
         assert params["path"] == str(test_file)
         assert params["content"] == "New content"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("input_newline", ["\r\n", "\r", "\n"])
+    @pytest.mark.parametrize("os_newline", ["\n", "\r\n"])
+    async def test_run_writes_with_os_linesep(
+        self,
+        input_newline: str,
+        os_newline: str,
+        mock_client: MockClient,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("vibe.acp.tools.builtins.write_file.os.linesep", os_newline)
+        tool = WriteFile(
+            config_getter=lambda: WriteFileConfig(),
+            state=AcpWriteFileState.model_construct(
+                client=mock_client, session_id="test_session"
+            ),
+        )
+
+        test_file = tmp_path / "test.txt"
+        content = input_newline.join(["line 1", "line 2", "line 3"])
+        args = WriteFileArgs(path=str(test_file), content=content)
+        await collect_result(tool.run(args))
+
+        assert mock_client._last_write_params["content"] == os_newline.join([
+            "line 1",
+            "line 2",
+            "line 3",
+        ])
+
+    @pytest.mark.asyncio
+    async def test_run_normalizes_mixed_newlines(
+        self, mock_client: MockClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("vibe.acp.tools.builtins.write_file.os.linesep", "\n")
+        tool = WriteFile(
+            config_getter=lambda: WriteFileConfig(),
+            state=AcpWriteFileState.model_construct(
+                client=mock_client, session_id="test_session"
+            ),
+        )
+
+        test_file = tmp_path / "test.txt"
+        args = WriteFileArgs(
+            path=str(test_file), content="line 1\r\nline 2\nline 3\rline 4"
+        )
+        await collect_result(tool.run(args))
+
+        assert (
+            mock_client._last_write_params["content"]
+            == "line 1\nline 2\nline 3\nline 4"
+        )
 
     @pytest.mark.asyncio
     async def test_run_write_error(
@@ -132,7 +183,7 @@ class TestAcpWriteFileExecution:
         tool = WriteFile(
             config_getter=lambda: WriteFileConfig(),
             state=AcpWriteFileState.model_construct(
-                client=mock_client, session_id="test_session", tool_call_id="test_call"
+                client=mock_client, session_id="test_session"
             ),
         )
 
@@ -151,7 +202,7 @@ class TestAcpWriteFileExecution:
         tool = WriteFile(
             config_getter=lambda: WriteFileConfig(),
             state=AcpWriteFileState.model_construct(
-                client=None, session_id="test_session", tool_call_id="test_call"
+                client=None, session_id="test_session"
             ),
         )
 
@@ -173,7 +224,7 @@ class TestAcpWriteFileExecution:
         tool = WriteFile(
             config_getter=lambda: WriteFileConfig(),
             state=AcpWriteFileState.model_construct(
-                client=mock_client, session_id=None, tool_call_id="test_call"
+                client=mock_client, session_id=None
             ),
         )
 
@@ -211,7 +262,25 @@ class TestAcpWriteFileSessionUpdates:
         assert update.content[0].new_text == "Hello"
         assert update.locations is not None
         assert len(update.locations) == 1
-        assert update.locations[0].path == "/tmp/test.txt"
+        assert update.locations[0].path == str(Path("/tmp/test.txt").resolve())
+
+    def test_tool_call_session_update_passes_content_through(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("vibe.acp.tools.builtins.write_file.os.linesep", "\r\n")
+        content = "line 1\r\nline 2\nline 3\rline 4"
+        event = ToolCallEvent(
+            tool_name="write_file",
+            tool_call_id="test_call_123",
+            args=WriteFileArgs(path="/tmp/test.txt", content=content),
+            tool_class=WriteFile,
+        )
+
+        update = WriteFile.tool_call_session_update(event)
+        assert update is not None
+        assert update.content is not None
+        assert isinstance(update.content, list)
+        assert update.content[0].new_text == content
 
     def test_tool_call_session_update_invalid_args(self) -> None:
         from vibe.core.types import FunctionCall, ToolCall
@@ -232,7 +301,8 @@ class TestAcpWriteFileSessionUpdates:
         )
 
         update = WriteFile.tool_call_session_update(event)
-        assert update is None
+        assert update is not None
+        assert update.title == "write_file"
 
     def test_tool_result_session_update(self) -> None:
         result = WriteFileResult(
@@ -260,7 +330,7 @@ class TestAcpWriteFileSessionUpdates:
         assert update.content[0].new_text == "Hello"
         assert update.locations is not None
         assert len(update.locations) == 1
-        assert update.locations[0].path == "/tmp/test.txt"
+        assert update.locations[0].path == str(Path("/tmp/test.txt").resolve())
 
     def test_tool_result_session_update_invalid_result(self) -> None:
         class InvalidResult:
@@ -274,4 +344,5 @@ class TestAcpWriteFileSessionUpdates:
         )
 
         update = WriteFile.tool_result_session_update(event)
-        assert update is None
+        assert update is not None
+        assert update.status == "failed"

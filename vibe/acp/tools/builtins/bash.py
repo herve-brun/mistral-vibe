@@ -5,7 +5,8 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from acp.schema import (
-    TerminalToolCallContent,
+    ContentToolCallContent,
+    TextContentBlock,
     ToolCallProgress,
     ToolCallStart,
     WaitForTerminalExitResponse,
@@ -13,6 +14,8 @@ from acp.schema import (
 
 from vibe import VIBE_ROOT
 from vibe.acp.tools.base import AcpToolState, BaseAcpTool
+from vibe.acp.tools.events import ToolTerminalOpenedEvent
+from vibe.acp.tools.session_update import failed_tool_result, resolve_kind
 from vibe.core.logger import logger
 from vibe.core.tools.base import BaseToolState, InvokeContext, ToolError
 from vibe.core.tools.builtins.bash import Bash as CoreBashTool, BashArgs, BashResult
@@ -34,7 +37,7 @@ class Bash(CoreBashTool, BaseAcpTool[AcpBashState]):
     async def run(
         self, args: BashArgs, ctx: InvokeContext | None = None
     ) -> AsyncGenerator[ToolStreamEvent | BashResult, None]:
-        client, session_id, _ = self._load_state()
+        client, session_id = self._load_state()
 
         timeout = args.timeout or self.config.default_timeout
         max_bytes = self.config.max_output_bytes
@@ -51,11 +54,14 @@ class Bash(CoreBashTool, BaseAcpTool[AcpBashState]):
 
         terminal_id = terminal.terminal_id
 
-        await self._send_in_progress_session_update([
-            TerminalToolCallContent(type="terminal", terminal_id=terminal_id)
-        ])
-
         try:
+            if ctx is not None:
+                yield ToolTerminalOpenedEvent(
+                    tool_name=self.get_name(),
+                    tool_call_id=ctx.tool_call_id,
+                    terminal_id=terminal_id,
+                )
+
             exit_response = await self._wait_for_terminal_exit(
                 terminal_id=terminal_id, timeout=timeout, command=args.command
             )
@@ -90,7 +96,7 @@ class Bash(CoreBashTool, BaseAcpTool[AcpBashState]):
     async def _wait_for_terminal_exit(
         self, terminal_id: str, timeout: int, command: str
     ) -> WaitForTerminalExitResponse:
-        client, session_id, _ = self._load_state()
+        client, session_id = self._load_state()
 
         try:
             return await asyncio.wait_for(
@@ -112,13 +118,18 @@ class Bash(CoreBashTool, BaseAcpTool[AcpBashState]):
     @classmethod
     def tool_call_session_update(cls, event: ToolCallEvent) -> ToolCallStart | None:
         if event.args is None:
+            # Title is left empty until args resolve so clients don't briefly
+            # render the tool name (e.g. "bash") as a stand-in command while
+            # the LLM is still streaming BashArgs. ACP requires title to be a
+            # str, so we use "" as the "unknown yet" sentinel.
             return ToolCallStart(
                 session_update="tool_call",
-                title="bash",
+                title="",
                 tool_call_id=event.tool_call_id,
-                kind="execute",
+                kind=resolve_kind(event.tool_name),
                 content=None,
                 raw_input=None,
+                field_meta={"tool_name": event.tool_name},
             )
         if not isinstance(event.args, BashArgs):
             raise ValueError(f"Unexpected tool args: {event.args}")
@@ -128,16 +139,30 @@ class Bash(CoreBashTool, BaseAcpTool[AcpBashState]):
             title=Bash.get_summary(event.args),
             content=None,
             tool_call_id=event.tool_call_id,
-            kind="execute",
+            kind=resolve_kind(event.tool_name),
             raw_input=event.args.model_dump_json(),
+            field_meta={"tool_name": event.tool_name},
         )
 
     @classmethod
     def tool_result_session_update(
         cls, event: ToolResultEvent
     ) -> ToolCallProgress | None:
+        if failure := failed_tool_result(event, BashResult):
+            return failure
+
         return ToolCallProgress(
             session_update="tool_call_update",
             tool_call_id=event.tool_call_id,
-            status="failed" if event.error else "completed",
+            status="completed",
+            content=[
+                ContentToolCallContent(
+                    type="content",
+                    content=TextContentBlock(
+                        type="text", text=cls.get_result_display(event).message
+                    ),
+                )
+            ],
+            kind=resolve_kind(event.tool_name),
+            field_meta={"tool_name": event.tool_name},
         )

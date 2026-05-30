@@ -7,20 +7,16 @@ from vibe import __version__
 from vibe.core.agent_loop import AgentLoop, TeleportError
 from vibe.core.agents.models import BuiltinAgentName
 from vibe.core.config import VibeConfig
+from vibe.core.hooks.models import HookConfigResult
 from vibe.core.logger import logger
 from vibe.core.output_formatters import create_formatter
+from vibe.core.telemetry.build_metadata import build_entrypoint_metadata
+from vibe.core.telemetry.types import ClientMetadata
 from vibe.core.teleport.types import (
     TeleportPushRequiredEvent,
     TeleportPushResponseEvent,
 )
-from vibe.core.types import (
-    AssistantEvent,
-    ClientMetadata,
-    EntrypointMetadata,
-    LLMMessage,
-    OutputFormat,
-    Role,
-)
+from vibe.core.types import AssistantEvent, LLMMessage, OutputFormat, Role
 from vibe.core.utils import ConversationLimitException
 
 __all__ = ["TeleportError", "run_programmatic"]
@@ -28,16 +24,19 @@ __all__ = ["TeleportError", "run_programmatic"]
 _DEFAULT_CLIENT_METADATA = ClientMetadata(name="vibe_programmatic", version=__version__)
 
 
-def run_programmatic(
+def run_programmatic(  # noqa: PLR0913, PLR0917
     config: VibeConfig,
     prompt: str,
     max_turns: int | None = None,
     max_price: float | None = None,
+    max_session_tokens: int | None = None,
     output_format: OutputFormat = OutputFormat.TEXT,
     previous_messages: list[LLMMessage] | None = None,
-    agent_name: str = BuiltinAgentName.AUTO_APPROVE,
+    agent_name: str = BuiltinAgentName.DEFAULT,
     client_metadata: ClientMetadata = _DEFAULT_CLIENT_METADATA,
     teleport: bool = False,
+    headless: bool = False,
+    hook_config_result: HookConfigResult | None = None,
 ) -> str | None:
     formatter = create_formatter(output_format)
 
@@ -47,13 +46,16 @@ def run_programmatic(
         message_observer=formatter.on_message_added,
         max_turns=max_turns,
         max_price=max_price,
+        max_session_tokens=max_session_tokens,
         enable_streaming=False,
-        entrypoint_metadata=EntrypointMetadata(
+        headless=headless,
+        entrypoint_metadata=build_entrypoint_metadata(
             agent_entrypoint="programmatic",
             agent_version=__version__,
             client_name=client_metadata.name,
             client_version=client_metadata.version,
         ),
+        hook_config_result=hook_config_result,
     )
     logger.info("USER: %s", prompt)
 
@@ -67,6 +69,9 @@ def run_programmatic(
                 logger.info(
                     "Loaded %d messages from previous session", len(non_system_messages)
                 )
+            else:
+                await agent_loop.initialize_experiments()
+                agent_loop.emit_new_session_telemetry()
 
             agent_loop.emit_new_session_telemetry()
 
@@ -94,6 +99,8 @@ def run_programmatic(
 
             return formatter.finalize()
         finally:
+            agent_loop.emit_session_closed_telemetry()
+            await agent_loop.aclose()
             await agent_loop.telemetry_client.aclose()
 
     return asyncio.run(_async_run())

@@ -11,6 +11,7 @@ from tests.stubs.fake_backend import FakeBackend
 from vibe.core.agents.manager import AgentManager
 from vibe.core.agents.models import (
     BUILTIN_AGENTS,
+    CHAT,
     AgentProfile,
     AgentSafety,
     AgentType,
@@ -18,7 +19,7 @@ from vibe.core.agents.models import (
     _deep_merge,
 )
 from vibe.core.config import VibeConfig
-from vibe.core.config.harness_files import HarnessFilesManager
+from vibe.core.prompts import UtilityPrompt
 from vibe.core.tools.base import ToolPermission
 from vibe.core.types import LLMChunk, LLMMessage, LLMUsage, Role
 
@@ -188,35 +189,54 @@ class TestAgentApplyToConfig:
             "exit_plan_mode",
         }
 
-    def test_custom_prompt_found_in_global_when_missing_from_project(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Regression test for https://github.com/mistralai/mistral-vibe/issues/288
-
-        When a custom prompt .md file is absent from the project-local prompts
-        directory, the system_prompt property should fall back to the global
-        ~/.vibe/prompts/ directory and load the file from there.
-        """
-        project_prompts = tmp_path / "project" / ".vibe" / "prompts"
-        project_prompts.mkdir(parents=True)
-
-        global_prompts = tmp_path / "home" / ".vibe" / "prompts"
-        global_prompts.mkdir(parents=True)
-        (global_prompts / "cc.md").write_text("Global custom prompt")
-
-        class _MockManager(HarnessFilesManager):
-            @property
-            def project_prompts_dirs(self) -> list[Path]:
-                return [project_prompts]
-
-            @property
-            def user_prompts_dirs(self) -> list[Path]:
-                return [global_prompts]
-
-        mock_manager = _MockManager(sources=("user",))
-        monkeypatch.setattr(
-            "vibe.core.config._settings.get_harness_files_manager", lambda: mock_manager
+    def test_base_disabled_tools_are_filtered_from_profile_enabled_tools(self) -> None:
+        base = VibeConfig(
+            include_project_context=False,
+            include_prompt_detail=False,
+            disabled_tools=["ask_user_question"],
         )
+
+        result = CHAT.apply_to_config(base)
+
+        assert "ask_user_question" not in result.enabled_tools
+        assert "grep" in result.enabled_tools
+        assert "read_file" in result.enabled_tools
+        assert "task" in result.enabled_tools
+
+    def test_base_disabled_tools_filter_supports_glob_patterns(self) -> None:
+        base = VibeConfig(
+            include_project_context=False,
+            include_prompt_detail=False,
+            disabled_tools=["ask_*"],
+        )
+        agent = AgentProfile(
+            name="custom",
+            display_name="Custom",
+            description="",
+            safety=AgentSafety.NEUTRAL,
+            overrides={"enabled_tools": ["grep", "ask_user_question", "ask_extra"]},
+        )
+
+        result = agent.apply_to_config(base)
+
+        assert result.enabled_tools == ["grep"]
+
+    def test_empty_base_disabled_tools_leaves_enabled_tools_untouched(self) -> None:
+        base = VibeConfig(
+            include_project_context=False,
+            include_prompt_detail=False,
+            disabled_tools=[],
+        )
+
+        result = CHAT.apply_to_config(base)
+
+        assert "ask_user_question" in result.enabled_tools
+
+    def test_custom_prompt_found_in_global_when_missing_from_project(
+        self, mock_prompts_dirs: tuple[Path, Path]
+    ) -> None:
+        _, global_prompts = mock_prompts_dirs
+        (global_prompts / "cc.md").write_text("Global custom prompt")
 
         base = VibeConfig(include_project_context=False, include_prompt_detail=False)
         agent = AgentProfile(
@@ -230,15 +250,99 @@ class TestAgentApplyToConfig:
         assert result.system_prompt_id == "cc"
         assert result.system_prompt == "Global custom prompt"
 
+    def test_custom_prompt_overrides_builtin(
+        self, mock_prompts_dirs: tuple[Path, Path]
+    ) -> None:
+        """Custom prompts in .vibe/prompts/ should override built-in prompts.
+
+        A user-provided explore.md (or any built-in prompt name) in the
+        project or user prompts directory must take priority over the
+        bundled SystemPrompt enum.
+        """
+        project_prompts, _ = mock_prompts_dirs
+        (project_prompts / "explore.md").write_text("My custom explore prompt")
+
+        config = VibeConfig(
+            system_prompt_id="explore",
+            include_project_context=False,
+            include_prompt_detail=False,
+        )
+        assert config.system_prompt == "My custom explore prompt"
+
+    def test_custom_compaction_prompt_found_in_global_when_missing_from_project(
+        self, mock_prompts_dirs: tuple[Path, Path]
+    ) -> None:
+        _, global_prompts = mock_prompts_dirs
+        (global_prompts / "proofs.md").write_text("Global custom compaction prompt")
+
+        config = VibeConfig(
+            compaction_prompt_id="proofs",
+            include_project_context=False,
+            include_prompt_detail=False,
+        )
+        assert config.compaction_prompt == "Global custom compaction prompt"
+
+    def test_custom_compaction_prompt_overrides_builtin(
+        self, mock_prompts_dirs: tuple[Path, Path]
+    ) -> None:
+        project_prompts, _ = mock_prompts_dirs
+        (project_prompts / "compact.md").write_text("My custom compact prompt")
+
+        config = VibeConfig(
+            compaction_prompt_id="compact",
+            include_project_context=False,
+            include_prompt_detail=False,
+        )
+        assert config.compaction_prompt == "My custom compact prompt"
+
+    def test_default_compaction_prompt_falls_back_to_builtin(
+        self, mock_prompts_dirs: tuple[Path, Path]
+    ) -> None:
+        config = VibeConfig(include_project_context=False, include_prompt_detail=False)
+        assert config.compaction_prompt == UtilityPrompt.COMPACT.read()
+
+    def test_invalid_compaction_prompt_reports_setting_name(
+        self, mock_prompts_dirs: tuple[Path, Path]
+    ) -> None:
+        project_prompts, user_prompts = mock_prompts_dirs
+        (project_prompts / "alpha.md").write_text("a")
+        (user_prompts / "beta.md").write_text("b")
+
+        with pytest.raises(ValueError) as exc_info:
+            VibeConfig(
+                compaction_prompt_id="unknown",
+                include_project_context=False,
+                include_prompt_detail=False,
+            )
+
+        error_text = str(exc_info.value)
+        assert "Invalid compaction_prompt_id value: 'unknown'" in error_text
+        assert 'available prompts ("compact")' in error_text
+        assert '(available: "alpha", "beta")' in error_text
+
+    @pytest.mark.parametrize(
+        "malicious_id",
+        ["../../../etc/passwd", "..", ".", "subdir/compact", "back\\slash", ""],
+    )
+    def test_prompt_id_rejects_path_traversal(
+        self, mock_prompts_dirs: tuple[Path, Path], malicious_id: str
+    ) -> None:
+        with pytest.raises(ValueError, match="must be a bare filename"):
+            VibeConfig(
+                compaction_prompt_id=malicious_id,
+                include_project_context=False,
+                include_prompt_detail=False,
+            )
+
 
 class TestAgentProfileOverrides:
     def test_default_agent_disables_exit_plan_mode(self) -> None:
         overrides = BUILTIN_AGENTS[BuiltinAgentName.DEFAULT].overrides
         assert "exit_plan_mode" in overrides.get("base_disabled", [])
 
-    def test_auto_approve_agent_sets_auto_approve(self) -> None:
+    def test_auto_approve_agent_sets_bypass_tool_permissions(self) -> None:
         overrides = BUILTIN_AGENTS[BuiltinAgentName.AUTO_APPROVE].overrides
-        assert overrides.get("auto_approve") is True
+        assert overrides.get("bypass_tool_permissions") is True
 
     def test_plan_agent_restricts_tools(self) -> None:
         overrides = BUILTIN_AGENTS[BuiltinAgentName.PLAN].overrides
@@ -601,29 +705,11 @@ class TestAgentManagerFiltering:
 
 class TestAgentLoopInitialization:
     def test_agent_system_prompt_id_is_applied_on_init(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, mock_prompts_dirs: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        project_prompts = tmp_path / "project" / ".vibe" / "prompts"
-        project_prompts.mkdir(parents=True)
-
-        global_prompts = tmp_path / "home" / ".vibe" / "prompts"
-        global_prompts.mkdir(parents=True)
+        _, global_prompts = mock_prompts_dirs
         custom_prompt_content = "CUSTOM_AGENT_PROMPT_MARKER"
         (global_prompts / "custom_agent.md").write_text(custom_prompt_content)
-
-        class _MockManager(HarnessFilesManager):
-            @property
-            def project_prompts_dirs(self) -> list[Path]:
-                return [project_prompts]
-
-            @property
-            def user_prompts_dirs(self) -> list[Path]:
-                return [global_prompts]
-
-        mock_manager = _MockManager(sources=("user",))
-        monkeypatch.setattr(
-            "vibe.core.config._settings.get_harness_files_manager", lambda: mock_manager
-        )
 
         custom_agent = AgentProfile(
             name="custom_test_agent",

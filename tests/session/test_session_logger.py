@@ -11,6 +11,8 @@ import pytest
 from tests.conftest import build_test_vibe_config
 from vibe.core.agents.models import AgentProfile, AgentSafety
 from vibe.core.config import SessionLoggingConfig, VibeConfig
+from vibe.core.experiments.models import EvalResponse
+from vibe.core.loop import ScheduledLoop
 from vibe.core.session.session_logger import SessionLogger
 from vibe.core.tools.manager import ToolManager
 from vibe.core.types import AgentStats, LLMMessage, Role, SessionMetadata
@@ -113,16 +115,12 @@ class TestSessionLoggerMetadata:
         self, mock_getuser, mock_subprocess, session_config: SessionLoggingConfig
     ) -> None:
         """Test that session metadata is correctly initialized."""
-        # Mock git commands
-        git_commit_mock = MagicMock()
-        git_commit_mock.returncode = 0
-        git_commit_mock.stdout = "abc123\n"
+        # Mock combined git command
+        git_mock = MagicMock()
+        git_mock.returncode = 0
+        git_mock.stdout = "abc123\nmain\n"
 
-        git_branch_mock = MagicMock()
-        git_branch_mock.returncode = 0
-        git_branch_mock.stdout = "main\n"
-
-        mock_subprocess.side_effect = [git_commit_mock, git_branch_mock]
+        mock_subprocess.return_value = git_mock
         mock_getuser.return_value = "testuser"
 
         session_id = "test-session-123"
@@ -139,6 +137,8 @@ class TestSessionLoggerMetadata:
         assert metadata.username == "testuser"
         assert "working_directory" in metadata.environment
         assert metadata.environment["working_directory"] == str(Path.cwd())
+        assert metadata.title is None
+        assert metadata.title_source == "auto"
 
     @patch("vibe.core.session.session_logger.subprocess.run")
     @patch("vibe.core.session.session_logger.getpass.getuser")
@@ -146,7 +146,7 @@ class TestSessionLoggerMetadata:
         self, mock_getuser, mock_subprocess, session_config: SessionLoggingConfig
     ) -> None:
         """Test that session metadata handles git command errors gracefully."""
-        # Mock git commands to fail
+        # Mock combined git command to fail
         mock_subprocess.side_effect = FileNotFoundError("git not found")
         mock_getuser.return_value = "testuser"
 
@@ -159,6 +159,128 @@ class TestSessionLoggerMetadata:
         assert metadata.git_commit is None
         assert metadata.git_branch is None
         assert metadata.username == "testuser"
+
+
+class TestSessionLoggerTitleManagement:
+    def test_set_title_marks_live_session_title_as_manual(
+        self, session_config: SessionLoggingConfig
+    ) -> None:
+        logger = SessionLogger(session_config, "test-session-123")
+
+        logger.set_title("Manual title")
+
+        assert logger.session_metadata is not None
+        assert logger.session_metadata.title == "Manual title"
+        assert logger.session_metadata.title_source == "manual"
+
+    def test_set_title_none_returns_live_session_to_auto_mode(
+        self, session_config: SessionLoggingConfig
+    ) -> None:
+        logger = SessionLogger(session_config, "test-session-123")
+        logger.set_title("Manual title")
+
+        logger.set_title(None)
+
+        assert logger.session_metadata is not None
+        assert logger.session_metadata.title is None
+        assert logger.session_metadata.title_source == "auto"
+
+    def test_set_title_rejects_empty_title(
+        self, session_config: SessionLoggingConfig
+    ) -> None:
+        logger = SessionLogger(session_config, "test-session-123")
+
+        with pytest.raises(ValueError, match="Session title cannot be empty."):
+            logger.set_title("   ")
+
+    def test_set_title_preserves_live_session_end_time(
+        self, session_config: SessionLoggingConfig
+    ) -> None:
+        logger = SessionLogger(session_config, "test-session-123")
+        assert logger.session_metadata is not None
+        logger.session_metadata.end_time = "2026-01-01T10:00:00+00:00"
+
+        logger.set_title("Manual title")
+
+        assert logger.session_metadata.end_time == "2026-01-01T10:00:00+00:00"
+
+    def test_set_initial_auto_title_applies_when_no_title_set(
+        self, session_config: SessionLoggingConfig
+    ) -> None:
+        logger = SessionLogger(session_config, "test-session-123")
+
+        applied = logger.set_initial_auto_title("Pretty title")
+
+        assert applied is True
+        assert logger.session_metadata is not None
+        assert logger.session_metadata.title == "Pretty title"
+        assert logger.session_metadata.title_source == "auto"
+
+    def test_set_initial_auto_title_noop_when_title_already_set(
+        self, session_config: SessionLoggingConfig
+    ) -> None:
+        logger = SessionLogger(session_config, "test-session-123")
+        logger.set_title("Manual title")
+
+        applied = logger.set_initial_auto_title("Pretty title")
+
+        assert applied is False
+        assert logger.session_metadata is not None
+        assert logger.session_metadata.title == "Manual title"
+        assert logger.session_metadata.title_source == "manual"
+
+    def test_set_initial_auto_title_noop_when_prior_auto_title_set(
+        self, session_config: SessionLoggingConfig
+    ) -> None:
+        logger = SessionLogger(session_config, "test-session-123")
+        logger.set_initial_auto_title("First title")
+
+        applied = logger.set_initial_auto_title("Second title")
+
+        assert applied is False
+        assert logger.session_metadata is not None
+        assert logger.session_metadata.title == "First title"
+
+    def test_set_initial_auto_title_rejects_blank(
+        self, session_config: SessionLoggingConfig
+    ) -> None:
+        logger = SessionLogger(session_config, "test-session-123")
+
+        applied = logger.set_initial_auto_title("   ")
+
+        assert applied is False
+        assert logger.session_metadata is not None
+        assert logger.session_metadata.title is None
+
+    def test_needs_initial_auto_title_true_when_no_title(
+        self, session_config: SessionLoggingConfig
+    ) -> None:
+        logger = SessionLogger(session_config, "test-session-123")
+
+        assert logger.needs_initial_auto_title() is True
+
+    def test_needs_initial_auto_title_false_after_set_initial_auto_title(
+        self, session_config: SessionLoggingConfig
+    ) -> None:
+        logger = SessionLogger(session_config, "test-session-123")
+        logger.set_initial_auto_title("Pretty title")
+
+        assert logger.needs_initial_auto_title() is False
+
+    def test_needs_initial_auto_title_false_after_manual_set_title(
+        self, session_config: SessionLoggingConfig
+    ) -> None:
+        logger = SessionLogger(session_config, "test-session-123")
+        logger.set_title("Manual title")
+
+        assert logger.needs_initial_auto_title() is False
+
+    def test_needs_initial_auto_title_false_when_disabled(
+        self, disabled_session_config: SessionLoggingConfig
+    ) -> None:
+        logger = SessionLogger(disabled_session_config, "test-session-123")
+
+        assert logger.needs_initial_auto_title() is False
 
 
 class TestSessionLoggerSaveInteraction:
@@ -234,6 +356,7 @@ class TestSessionLoggerSaveInteraction:
             assert metadata["stats"]["steps"] == stats.steps
             assert "title" in metadata
             assert metadata["title"] == "Hello"
+            assert metadata["title_source"] == "auto"
             assert "system_prompt" in metadata
 
     @pytest.mark.asyncio
@@ -447,6 +570,7 @@ class TestSessionLoggerSaveInteraction:
             assert metadata["total_messages"] == 1
             assert metadata["stats"]["steps"] == stats.steps
             assert metadata["title"] == "Untitled session"
+            assert metadata["title_source"] == "auto"
 
         messages_file = logger.session_dir / "messages.jsonl"
         assert messages_file.exists()
@@ -496,6 +620,87 @@ class TestSessionLoggerSaveInteraction:
             assert metadata["stats"]["steps"] == stats.steps
             expected_title = long_message[:50] + "…"
             assert metadata["title"] == expected_title
+            assert metadata["title_source"] == "auto"
+
+    @pytest.mark.asyncio
+    async def test_save_interaction_preserves_preset_auto_title(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: VibeConfig,
+        mock_tool_manager: ToolManager,
+        mock_agent_profile: AgentProfile,
+    ) -> None:
+        session_id = "test-session-123"
+        logger = SessionLogger(session_config, session_id)
+        assert logger.session_metadata is not None
+
+        logger.set_initial_auto_title("Pretty @foo.py title")
+
+        messages = [
+            LLMMessage(role=Role.system, content="System prompt"),
+            LLMMessage(
+                role=Role.user, content="path: file:///abs/foo.py\ncontent: ..."
+            ),
+            LLMMessage(role=Role.assistant, content="Hi there!"),
+        ]
+        stats = AgentStats(
+            steps=1, session_prompt_tokens=10, session_completion_tokens=20
+        )
+
+        await logger.save_interaction(
+            messages=messages,
+            stats=stats,
+            base_config=mock_vibe_config,
+            tool_manager=mock_tool_manager,
+            agent_profile=mock_agent_profile,
+        )
+
+        assert logger.session_dir is not None
+        metadata_file = logger.session_dir / "meta.json"
+        with open(metadata_file) as f:
+            metadata = json.load(f)
+
+        assert metadata["title"] == "Pretty @foo.py title"
+        assert metadata["title_source"] == "auto"
+
+    @pytest.mark.asyncio
+    async def test_save_interaction_preserves_manual_title(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: VibeConfig,
+        mock_tool_manager: ToolManager,
+        mock_agent_profile: AgentProfile,
+    ) -> None:
+        session_id = "test-session-123"
+        logger = SessionLogger(session_config, session_id)
+        assert logger.session_metadata is not None
+
+        logger.set_title("Manual title")
+
+        messages = [
+            LLMMessage(role=Role.system, content="System prompt"),
+            LLMMessage(role=Role.user, content="Hello"),
+            LLMMessage(role=Role.assistant, content="Hi there!"),
+        ]
+        stats = AgentStats(
+            steps=1, session_prompt_tokens=10, session_completion_tokens=20
+        )
+
+        await logger.save_interaction(
+            messages=messages,
+            stats=stats,
+            base_config=mock_vibe_config,
+            tool_manager=mock_tool_manager,
+            agent_profile=mock_agent_profile,
+        )
+
+        assert logger.session_dir is not None
+        metadata_file = logger.session_dir / "meta.json"
+        with open(metadata_file) as f:
+            metadata = json.load(f)
+
+        assert metadata["title"] == "Manual title"
+        assert metadata["title_source"] == "manual"
 
         messages_file = logger.session_dir / "messages.jsonl"
         assert messages_file.exists()
@@ -780,3 +985,286 @@ class TestSessionLoggerCleanupTmpFiles:
             logger.maybe_cleanup_tmp_files()
 
         assert cleanup_spy.call_count == 2
+
+
+class TestPersistLoops:
+    @pytest.mark.asyncio
+    async def test_writes_into_existing_metadata(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: VibeConfig,
+        mock_tool_manager: ToolManager,
+        mock_agent_profile: AgentProfile,
+    ) -> None:
+        logger = SessionLogger(session_config, "test-session-loops")
+        await logger.save_interaction(
+            messages=[
+                LLMMessage(role=Role.system, content="System prompt"),
+                LLMMessage(role=Role.user, content="Hello"),
+                LLMMessage(role=Role.assistant, content="Hi there!"),
+            ],
+            stats=AgentStats(steps=1),
+            base_config=mock_vibe_config,
+            tool_manager=mock_tool_manager,
+            agent_profile=mock_agent_profile,
+        )
+
+        assert logger.session_metadata is not None
+        logger.session_metadata.loops = [
+            ScheduledLoop(
+                id="aabbccdd",
+                interval_seconds=30,
+                prompt="ping",
+                next_fire_at=12345.0,
+                created_at=12000.0,
+            )
+        ]
+        await logger.persist_loops()
+
+        assert logger.session_dir is not None
+        with open(logger.session_dir / "meta.json") as f:
+            metadata = json.load(f)
+
+        assert metadata["session_id"] == "test-session-loops"
+        assert metadata["total_messages"] == 2
+        assert metadata["loops"] == [
+            {
+                "id": "aabbccdd",
+                "interval_seconds": 30,
+                "prompt": "ping",
+                "next_fire_at": 12345.0,
+                "created_at": 12000.0,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_noop_when_metadata_file_missing(
+        self, session_config: SessionLoggingConfig
+    ) -> None:
+        logger = SessionLogger(session_config, "no-meta-session")
+        assert logger.session_dir is not None
+        # No save_interaction was called -> meta.json does not exist
+        assert not (logger.session_dir / "meta.json").exists()
+
+        assert logger.session_metadata is not None
+        logger.session_metadata.loops = [
+            ScheduledLoop(
+                id="aabbccdd",
+                interval_seconds=30,
+                prompt="ping",
+                next_fire_at=1.0,
+                created_at=0.0,
+            )
+        ]
+        await logger.persist_loops()
+
+        assert not (logger.session_dir / "meta.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_noop_when_logging_disabled(
+        self, disabled_session_config: SessionLoggingConfig
+    ) -> None:
+        logger = SessionLogger(disabled_session_config, "ignored")
+        # Should not raise even though session_metadata is None
+        await logger.persist_loops()
+
+    @pytest.mark.asyncio
+    async def test_subsequent_save_interaction_preserves_loops(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: VibeConfig,
+        mock_tool_manager: ToolManager,
+        mock_agent_profile: AgentProfile,
+    ) -> None:
+        logger = SessionLogger(session_config, "loops-vs-save")
+        messages = [
+            LLMMessage(role=Role.system, content="System prompt"),
+            LLMMessage(role=Role.user, content="Hello"),
+            LLMMessage(role=Role.assistant, content="Hi there!"),
+        ]
+        await logger.save_interaction(
+            messages=messages,
+            stats=AgentStats(steps=1),
+            base_config=mock_vibe_config,
+            tool_manager=mock_tool_manager,
+            agent_profile=mock_agent_profile,
+        )
+
+        assert logger.session_metadata is not None
+        logger.session_metadata.loops = [
+            ScheduledLoop(
+                id="aabbccdd",
+                interval_seconds=30,
+                prompt="ping",
+                next_fire_at=12345.0,
+                created_at=12000.0,
+            )
+        ]
+        await logger.persist_loops()
+
+        # A subsequent save (e.g. user sends another message) must not
+        # overwrite the on-disk loops with the stale in-memory value.
+        more_messages = [*messages, LLMMessage(role=Role.user, content="Again")]
+        await logger.save_interaction(
+            messages=more_messages,
+            stats=AgentStats(steps=2),
+            base_config=mock_vibe_config,
+            tool_manager=mock_tool_manager,
+            agent_profile=mock_agent_profile,
+        )
+
+        assert logger.session_dir is not None
+        with open(logger.session_dir / "meta.json") as f:
+            metadata = json.load(f)
+        assert len(metadata["loops"]) == 1
+        assert metadata["loops"][0]["id"] == "aabbccdd"
+
+
+class TestPersistExperiments:
+    @pytest.fixture
+    def sample_response(self) -> EvalResponse:
+        return EvalResponse.model_validate({
+            "features": {
+                "vibe_code_cli_test_ab": {
+                    "defaultValue": "cli",
+                    "rules": [
+                        {
+                            "force": "cli_v2",
+                            "tracks": [
+                                {
+                                    "experiment": {"key": "vibe_code_cli_test_ab"},
+                                    "result": {
+                                        "key": "1",
+                                        "variationId": 1,
+                                        "inExperiment": True,
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+        })
+
+    @pytest.mark.asyncio
+    async def test_writes_field_into_existing_metadata(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: VibeConfig,
+        mock_tool_manager: ToolManager,
+        mock_agent_profile: AgentProfile,
+        sample_response: EvalResponse,
+    ) -> None:
+        logger = SessionLogger(session_config, "exp-session")
+        await logger.save_interaction(
+            messages=[
+                LLMMessage(role=Role.system, content="System prompt"),
+                LLMMessage(role=Role.user, content="Hello"),
+            ],
+            stats=AgentStats(steps=1),
+            base_config=mock_vibe_config,
+            tool_manager=mock_tool_manager,
+            agent_profile=mock_agent_profile,
+        )
+
+        await logger.persist_experiments(sample_response)
+
+        assert logger.session_dir is not None
+        with open(logger.session_dir / "meta.json") as f:
+            metadata = json.load(f)
+        assert "experiments" in metadata
+        assert (
+            metadata["experiments"]["features"]["vibe_code_cli_test_ab"]["defaultValue"]
+            == "cli"
+        )
+
+    @pytest.mark.asyncio
+    async def test_persists_none_as_null(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: VibeConfig,
+        mock_tool_manager: ToolManager,
+        mock_agent_profile: AgentProfile,
+    ) -> None:
+        logger = SessionLogger(session_config, "exp-none")
+        await logger.save_interaction(
+            messages=[
+                LLMMessage(role=Role.system, content="x"),
+                LLMMessage(role=Role.user, content="y"),
+            ],
+            stats=AgentStats(steps=1),
+            base_config=mock_vibe_config,
+            tool_manager=mock_tool_manager,
+            agent_profile=mock_agent_profile,
+        )
+
+        await logger.persist_experiments(None)
+
+        assert logger.session_dir is not None
+        with open(logger.session_dir / "meta.json") as f:
+            metadata = json.load(f)
+        assert metadata.get("experiments") is None
+
+    @pytest.mark.asyncio
+    async def test_does_not_create_metadata_file_when_missing(
+        self, session_config: SessionLoggingConfig, sample_response: EvalResponse
+    ) -> None:
+        # Sessions without any message must not be persisted at all —
+        # persist_experiments updates only in-memory state when meta.json is
+        # absent, and lets the eventual save_interaction write it.
+        logger = SessionLogger(session_config, "fresh-session")
+        assert logger.session_dir is not None
+        assert not (logger.session_dir / "meta.json").exists()
+
+        await logger.persist_experiments(sample_response)
+
+        assert not (logger.session_dir / "meta.json").exists()
+        assert logger.session_metadata is not None
+        assert logger.session_metadata.experiments == sample_response
+
+    @pytest.mark.asyncio
+    async def test_noop_when_logging_disabled(
+        self,
+        disabled_session_config: SessionLoggingConfig,
+        sample_response: EvalResponse,
+    ) -> None:
+        logger = SessionLogger(disabled_session_config, "ignored")
+        await logger.persist_experiments(sample_response)
+
+    @pytest.mark.asyncio
+    async def test_first_save_interaction_includes_in_memory_experiments(
+        self,
+        session_config: SessionLoggingConfig,
+        mock_vibe_config: VibeConfig,
+        mock_tool_manager: ToolManager,
+        mock_agent_profile: AgentProfile,
+        sample_response: EvalResponse,
+    ) -> None:
+        # Real flow: persist_experiments at session start (no meta.json yet,
+        # in-memory only). The first save_interaction must succeed AND
+        # include the experiments snapshot in the eventual meta.json.
+        logger = SessionLogger(session_config, "first-save-after-experiments")
+        await logger.persist_experiments(sample_response)
+
+        assert logger.session_dir is not None
+        assert not (logger.session_dir / "meta.json").exists()
+
+        await logger.save_interaction(
+            messages=[
+                LLMMessage(role=Role.system, content="System prompt"),
+                LLMMessage(role=Role.user, content="Hello"),
+                LLMMessage(role=Role.assistant, content="Hi"),
+            ],
+            stats=AgentStats(steps=1),
+            base_config=mock_vibe_config,
+            tool_manager=mock_tool_manager,
+            agent_profile=mock_agent_profile,
+        )
+
+        with open(logger.session_dir / "meta.json") as f:
+            metadata = json.load(f)
+        assert metadata["total_messages"] == 2
+        assert (
+            metadata["experiments"]["features"]["vibe_code_cli_test_ab"]["defaultValue"]
+            == "cli"
+        )

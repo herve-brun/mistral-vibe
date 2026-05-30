@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 import copy
 from enum import StrEnum, auto
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, overload
 from uuid import uuid4
 
@@ -24,6 +25,18 @@ from pydantic import (
     computed_field,
     model_validator,
 )
+
+from vibe.core.experiments.models import EvalResponse
+
+
+class ScheduledLoop(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    interval_seconds: int
+    prompt: str
+    next_fire_at: float
+    created_at: float
 
 
 class Backend(StrEnum):
@@ -135,24 +148,17 @@ class SessionInfo(BaseModel):
 
 class SessionMetadata(BaseModel):
     session_id: str
+    parent_session_id: str | None = None
     start_time: str
     end_time: str | None
     git_commit: str | None
     git_branch: str | None
     environment: dict[str, str | None]
     username: str
-
-
-class ClientMetadata(BaseModel):
-    name: str
-    version: str
-
-
-class EntrypointMetadata(BaseModel):
-    agent_entrypoint: Literal["cli", "acp", "programmatic"]
-    agent_version: str
-    client_name: str
-    client_version: str
+    loops: list[ScheduledLoop] = Field(default_factory=list)
+    title: str | None = None
+    title_source: Literal["auto", "manual"] = "auto"
+    experiments: EvalResponse | None = None
 
 
 StrToolChoice = Literal["auto", "none", "any", "required"]
@@ -217,6 +223,7 @@ class LLMMessage(BaseModel):
     content: Content | None = None
     injected: bool = False
     reasoning_content: Content | None = None
+    reasoning_state: list[str] | None = None
     reasoning_signature: str | None = None
     reasoning_message_id: str | None = None
     tool_calls: list[ToolCall] | None = None
@@ -241,6 +248,7 @@ class LLMMessage(BaseModel):
             "role": role,
             "content": getattr(v, "content", ""),
             "reasoning_content": reasoning_content,
+            "reasoning_state": getattr(v, "reasoning_state", None),
             "reasoning_signature": getattr(v, "reasoning_signature", None),
             "reasoning_message_id": getattr(v, "reasoning_message_id", None)
             or (str(uuid4()) if reasoning_content else None),
@@ -278,6 +286,13 @@ class LLMMessage(BaseModel):
         if not reasoning_signature:
             reasoning_signature = None
 
+        reasoning_state: list[str] | None = None
+        if self.reasoning_state or other.reasoning_state:
+            reasoning_state = [
+                *(self.reasoning_state or []),
+                *(other.reasoning_state or []),
+            ]
+
         tool_calls_map = OrderedDict[int, ToolCall]()
         for tool_calls in [self.tool_calls or [], other.tool_calls or []]:
             for tc in tool_calls:
@@ -303,6 +318,7 @@ class LLMMessage(BaseModel):
             role=self.role,
             content=content,
             reasoning_content=reasoning_content,
+            reasoning_state=reasoning_state,
             reasoning_signature=reasoning_signature,
             reasoning_message_id=self.reasoning_message_id
             or other.reasoning_message_id,
@@ -414,9 +430,9 @@ class CompactStartEvent(BaseEvent):
 
 
 class CompactEndEvent(BaseEvent):
-    old_context_tokens: int
-    new_context_tokens: int
     summary_length: int
+    old_session_id: str | None = None
+    new_session_id: str | None = None
     # WORKAROUND: Using tool_call to communicate compact events to the client.
     # This should be revisited when the ACP protocol defines how compact events
     # should be represented.
@@ -424,10 +440,22 @@ class CompactEndEvent(BaseEvent):
     tool_call_id: str
 
 
+class PlanReviewRequestedEvent(BaseEvent):
+    file_path: Path
+
+
+class PlanReviewEndedEvent(BaseEvent):
+    pass
+
+
 class AgentProfileChangedEvent(BaseEvent):
     """Emitted when the active agent profile changes during a turn."""
 
     agent_name: str
+
+
+class SessionTitleUpdatedEvent(BaseEvent):
+    title: str
 
 
 class OutputFormat(StrEnum):
@@ -532,4 +560,14 @@ class RateLimitError(Exception):
         self.model = model
         super().__init__(
             "Rate limits exceeded. Please wait a moment before trying again."
+        )
+
+
+class ContextTooLongError(Exception):
+    def __init__(self, provider: str, model: str) -> None:
+        self.provider = provider
+        self.model = model
+        super().__init__(
+            "The conversation context exceeds the model's maximum limit. "
+            "Use /rewind to undo recent actions, then /compact to summarize the conversation."
         )

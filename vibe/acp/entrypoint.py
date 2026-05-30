@@ -15,6 +15,7 @@ from vibe.core.config.harness_files import (
 )
 from vibe.core.logger import logger
 from vibe.core.paths import HISTORY_FILE
+from vibe.core.telemetry.build_metadata import build_entrypoint_metadata
 
 # Configure line buffering for subprocess communication
 sys.stdout.reconfigure(line_buffering=True)  # pyright: ignore[reportAttributeAccessIssue]
@@ -59,6 +60,7 @@ def bootstrap_config_files() -> None:
             raise
 
 
+# When DEBUG_MODE=true, attaches debugpy on localhost:5678.
 def handle_debug_mode() -> None:
     if os.environ.get("DEBUG_MODE") != "true":
         return
@@ -82,11 +84,19 @@ def main() -> None:
     from vibe.core.tracing import setup_tracing
     from vibe.setup.onboarding import run_onboarding
 
+    environ_before_dotenv_load = os.environ.copy()
     load_dotenv_values()
     bootstrap_config_files()
     args = parse_arguments()
     if args.setup:
-        run_onboarding()
+        run_onboarding(
+            entrypoint_metadata=build_entrypoint_metadata(
+                agent_entrypoint="acp",
+                agent_version=__version__,
+                client_name="vibe_acp",
+                client_version=__version__,
+            )
+        )
         sys.exit(0)
 
     try:
@@ -95,7 +105,7 @@ def main() -> None:
     except Exception:
         pass  # tracing disabled
 
-    run_acp_server()
+    run_acp_server(environ_before_dotenv_load=environ_before_dotenv_load)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import aclosing
+from dataclasses import dataclass
+from datetime import UTC
+import logging
 import os
 from pathlib import Path
+import signal
 import sys
-from typing import Any, cast, override
+from typing import Any, Protocol, cast, override
 from uuid import uuid4
 
 from acp import (
@@ -45,13 +49,17 @@ from acp.schema import (
     PromptCapabilities,
     ResumeSessionResponse,
     SessionCapabilities,
+    SessionCloseCapabilities,
     SessionConfigOptionBoolean,
     SessionConfigOptionSelect,
+    SessionForkCapabilities,
     SessionInfo,
+    SessionInfoUpdate,
     SessionListCapabilities,
     SetSessionConfigOptionResponse,
     SseMcpServer,
     TerminalAuthMethod,
+    TerminalToolCallContent,
     TextContentBlock,
     TextResourceContents,
     ToolCallProgress,
@@ -60,13 +68,14 @@ from acp.schema import (
     Usage,
     UsageUpdate,
 )
-from pydantic import BaseModel, ConfigDict, SkipValidation
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 
 from vibe import VIBE_ROOT, __version__
 from vibe.acp.acp_logger import acp_message_observer
 from vibe.acp.commands import AcpCommandRegistry
 from vibe.acp.exceptions import (
     ConfigurationError,
+    ContextTooLongError,
     ConversationLimitError,
     InternalError,
     InvalidRequestError,
@@ -76,13 +85,21 @@ from vibe.acp.exceptions import (
     SessionNotFoundError,
     UnauthenticatedError,
 )
+from vibe.acp.session import AcpSessionLoop
+from vibe.acp.title import acp_blocks_to_title_segments
 from vibe.acp.tools.base import BaseAcpTool
+from vibe.acp.tools.events import ToolTerminalOpenedEvent
 from vibe.acp.tools.session_update import (
+    resolve_kind,
     tool_call_session_update,
     tool_result_session_update,
 )
 from vibe.acp.utils import (
+    THINKING_LEVELS,
+    ThinkingLevel,
     ToolOption,
+    build_mode_state,
+    build_model_state,
     build_permission_options,
     create_assistant_message_replay,
     create_compact_end_session_update,
@@ -93,27 +110,38 @@ from vibe.acp.utils import (
     create_user_message_replay,
     get_proxy_help_text,
     is_valid_acp_mode,
-    make_mode_response,
-    make_model_response,
+    make_thinking_response,
 )
 from vibe.core.agent_loop import AgentLoop
 from vibe.core.agents.models import CHAT as CHAT_AGENT, BuiltinAgentName
 from vibe.core.autocompletion.path_prompt_adapter import render_path_prompt
 from vibe.core.config import (
     MissingAPIKeyError,
+    ProviderConfig,
     SessionLoggingConfig,
     VibeConfig,
     load_dotenv_values,
 )
 from vibe.core.data_retention import DATA_RETENTION_MESSAGE
+from vibe.core.feedback import record_feedback_asked, should_show_feedback
+from vibe.core.hooks.config import load_hooks_from_fs
+from vibe.core.paths import GLOBAL_ENV_FILE
 from vibe.core.proxy_setup import (
     ProxySetupError,
     parse_proxy_command,
     set_proxy_var,
     unset_proxy_var,
 )
+from vibe.core.session.saved_sessions import (
+    update_saved_session_title,
+    update_saved_session_title_at_path,
+)
 from vibe.core.session.session_loader import SessionLoader
+from vibe.core.session.title_format import format_session_title
 from vibe.core.skills.manager import SkillManager
+from vibe.core.telemetry.build_metadata import build_entrypoint_metadata
+from vibe.core.telemetry.send import TelemetryClient
+from vibe.core.telemetry.types import EntrypointMetadata
 from vibe.core.tools.permissions import RequiredPermission
 from vibe.core.types import (
     AgentProfileChangedEvent,
@@ -122,11 +150,12 @@ from vibe.core.types import (
     AssistantEvent,
     CompactEndEvent,
     CompactStartEvent,
-    EntrypointMetadata,
+    ContextTooLongError as CoreContextTooLongError,
     LLMMessage,
     RateLimitError as CoreRateLimitError,
     ReasoningEvent,
     Role,
+    SessionTitleUpdatedEvent,
     ToolCallEvent,
     ToolResultEvent,
     ToolStreamEvent,
@@ -136,6 +165,90 @@ from vibe.core.utils import (
     ConversationLimitException,
     get_user_cancellation_message,
 )
+from vibe.setup.auth import (
+    AuthState,
+    AuthStateKind,
+    BrowserSignInAttempt,
+    BrowserSignInError,
+    BrowserSignInErrorCode,
+    BrowserSignInService,
+    HttpBrowserSignInGateway,
+    assess_auth_state,
+)
+from vibe.setup.auth.api_key_persistence import (
+    persist_api_key,
+    remove_api_key,
+    resolve_api_key_provider,
+)
+from vibe.setup.onboarding.context import OnboardingContext
+
+logger = logging.getLogger("vibe")
+
+NON_INTERACTIVE_DISABLED_TOOLS = ["ask_user_question", "exit_plan_mode"]
+
+
+class ForkSessionParams(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    message_id: str | None = Field(default=None, alias="messageId")
+
+
+class SessionSetTitleRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    session_id: str = Field(
+        validation_alias=AliasChoices("session_id", "sessionId"), min_length=1
+    )
+    title: str = Field(min_length=1)
+
+
+class TelemetrySendNotification(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    event: str
+    properties: dict[str, Any] = Field(default_factory=dict)
+    session_id: str = Field(validation_alias=AliasChoices("session_id", "sessionId"))
+
+
+class AuthStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    authenticated: bool
+    auth_state: AuthStateKind = Field(alias="authState")
+    sign_out_available: bool = Field(alias="signOutAvailable")
+
+
+def _auth_status_response_from_auth_state(auth_state: AuthState) -> AuthStatusResponse:
+    return AuthStatusResponse(
+        authenticated=auth_state.can_use_active_provider,
+        authState=auth_state.kind,
+        signOutAvailable=auth_state.sign_out_available,
+    )
+
+
+def _dispatch_at_mention_inserted(
+    client: TelemetryClient, properties: dict[str, Any]
+) -> None:
+    client.send_at_mention_inserted(
+        nb_mentions=properties.get("nb_mentions", 0),
+        context_types=properties.get("context_types", {}),
+        file_extensions=properties.get("file_extensions"),
+        message_id=properties.get("message_id"),
+    )
+
+
+def _dispatch_user_rating_feedback(
+    client: TelemetryClient, properties: dict[str, Any]
+) -> None:
+    client.send_user_rating_feedback(
+        rating=properties.get("rating", 0), model=properties.get("model", "")
+    )
+
+
+_EVENT_DISPATCHERS: dict[str, Callable[[TelemetryClient, dict[str, Any]], None]] = {
+    "vibe.at_mention_inserted": _dispatch_at_mention_inserted,
+    "vibe.user_rating_feedback": _dispatch_user_rating_feedback,
+}
 
 
 def _resolved_user_message_id(client_message_id: str | None) -> str:
@@ -144,21 +257,132 @@ def _resolved_user_message_id(client_message_id: str | None) -> str:
     return str(uuid4())
 
 
-class AcpSessionLoop(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-    id: str
-    agent_loop: AgentLoop
-    command_registry: SkipValidation[AcpCommandRegistry]
-    task: asyncio.Task[None] | None = None
+@dataclass(frozen=True)
+class PendingBrowserSignInAttempt:
+    attempt: BrowserSignInAttempt
+    provider: ProviderConfig
+
+
+RETRYABLE_BROWSER_SIGN_IN_COMPLETION_ERRORS = {
+    BrowserSignInErrorCode.EXCHANGE_FAILED,
+    BrowserSignInErrorCode.POLL_FAILED,
+}
+
+
+OnboardingContextLoader = Callable[[], OnboardingContext]
+ApiKeyPersister = Callable[[ProviderConfig, str], str]
+ApiKeyRemover = Callable[[ProviderConfig], None]
+
+
+class BrowserSignInServiceAdapter(Protocol):
+    async def authenticate(self) -> str: ...
+
+    async def start_attempt(self) -> BrowserSignInAttempt: ...
+
+    async def complete_attempt(self, attempt: BrowserSignInAttempt) -> str: ...
+
+    async def aclose(self) -> None: ...
+
+
+BrowserSignInServiceFactory = Callable[[ProviderConfig], BrowserSignInServiceAdapter]
 
 
 class VibeAcpAgentLoop(AcpAgent):
     client: Client
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        onboarding_context_loader: OnboardingContextLoader | None = None,
+        browser_sign_in_service_factory: BrowserSignInServiceFactory | None = None,
+        api_key_persister: ApiKeyPersister = persist_api_key,
+        api_key_remover: ApiKeyRemover = remove_api_key,
+        environ_before_dotenv_load: Mapping[str, str] | None = None,
+    ) -> None:
         self.sessions: dict[str, AcpSessionLoop] = {}
         self.client_capabilities: ClientCapabilities | None = None
         self.client_info: Implementation | None = None
+        self._environ_before_dotenv_load = dict(
+            environ_before_dotenv_load
+            if environ_before_dotenv_load is not None
+            else os.environ
+        )
+        self._pending_browser_sign_in_attempts: dict[
+            str, PendingBrowserSignInAttempt
+        ] = {}
+        self._load_onboarding_context = (
+            onboarding_context_loader or OnboardingContext.load
+        )
+        self._browser_sign_in_service_factory = (
+            browser_sign_in_service_factory or self._build_browser_sign_in_service
+        )
+        self._persist_api_key = api_key_persister
+        self._remove_api_key = api_key_remover
+
+    def _build_browser_auth_method(
+        self, context: OnboardingContext, method_id: str
+    ) -> AuthMethodAgent | None:
+        if not context.supports_browser_sign_in:
+            return None
+
+        return AuthMethodAgent(
+            id=method_id,
+            name="Sign in through Mistral AI Studio",
+            description="Sign into Mistral Vibe through your Mistral AI Studio account.",
+        )
+
+    def _build_terminal_auth_method(
+        self, command: str, args: list[str]
+    ) -> TerminalAuthMethod:
+        return TerminalAuthMethod(
+            type="terminal",
+            id="vibe-setup",
+            name="Register your API Key",
+            description="Register your API Key inside Mistral Vibe",
+            field_meta={
+                "terminal-auth": {
+                    "command": command,
+                    "args": args,
+                    "label": "Mistral Vibe Setup",
+                }
+            },
+        )
+
+    def _build_browser_sign_in_service(
+        self, provider: ProviderConfig | None = None
+    ) -> BrowserSignInService:
+        provider = provider or self._load_onboarding_context().provider
+        if not provider.supports_browser_sign_in:
+            raise InvalidRequestError(
+                "Browser sign-in is not available for the configured provider."
+            )
+
+        browser_base_url = provider.browser_auth_base_url
+        api_base_url = provider.browser_auth_api_base_url
+        if browser_base_url is None or api_base_url is None:
+            raise ConfigurationError("Browser sign-in requires both browser auth URLs.")
+
+        return BrowserSignInService(
+            HttpBrowserSignInGateway(
+                browser_base_url=browser_base_url, api_base_url=api_base_url
+            )
+        )
+
+    def _load_enabled_browser_sign_in_context(self) -> OnboardingContext:
+        context = self._load_onboarding_context()
+        if not context.supports_browser_sign_in:
+            raise InvalidRequestError(
+                "Browser sign-in is not available for the configured provider."
+            )
+        return context
+
+    def _supports_delegated_browser_auth(self) -> bool:
+        return bool(
+            self.client_capabilities
+            and self.client_capabilities.field_meta
+            and self.client_capabilities.field_meta.get("browser-auth-delegated")
+            is True
+        )
 
     @override
     async def initialize(
@@ -193,25 +417,21 @@ class VibeAcpAgentLoop(AcpAgent):
             and self.client_capabilities.field_meta.get("terminal-auth") is True
         )
 
-        auth_methods: list[EnvVarAuthMethod | TerminalAuthMethod | AuthMethodAgent] = (
-            [
-                TerminalAuthMethod(
-                    type="terminal",
-                    id="vibe-setup",
-                    name="Register your API Key",
-                    description="Register your API Key inside Mistral Vibe",
-                    field_meta={
-                        "terminal-auth": {
-                            "command": command,
-                            "args": args,
-                            "label": "Mistral Vibe Setup",
-                        }
-                    },
-                )
-            ]
-            if supports_terminal_auth
-            else []
-        )
+        context = self._load_onboarding_context()
+
+        auth_methods: list[EnvVarAuthMethod | TerminalAuthMethod | AuthMethodAgent] = []
+        if browser_auth_method := self._build_browser_auth_method(
+            context, "browser-auth"
+        ):
+            auth_methods.append(browser_auth_method)
+        if self._supports_delegated_browser_auth():
+            delegated_browser_auth_method = self._build_browser_auth_method(
+                context, "browser-auth-delegated"
+            )
+            if delegated_browser_auth_method is not None:
+                auth_methods.append(delegated_browser_auth_method)
+        if supports_terminal_auth:
+            auth_methods.append(self._build_terminal_auth_method(command, args))
 
         response = InitializeResponse(
             agent_capabilities=AgentCapabilities(
@@ -220,7 +440,9 @@ class VibeAcpAgentLoop(AcpAgent):
                     audio=False, embedded_context=True, image=False
                 ),
                 session_capabilities=SessionCapabilities(
-                    list=SessionListCapabilities()
+                    close=SessionCloseCapabilities(),
+                    list=SessionListCapabilities(),
+                    fork=SessionForkCapabilities(),
                 ),
             ),
             protocol_version=PROTOCOL_VERSION,
@@ -233,14 +455,121 @@ class VibeAcpAgentLoop(AcpAgent):
         )
         return response
 
+    async def _authenticate_browser_auth(self, **kwargs: Any) -> AuthenticateResponse:
+        action = kwargs.get("action")
+        if action not in {None, "start"}:
+            raise InvalidRequestError(f"Unsupported browser auth action: {action}")
+
+        provider = self._load_enabled_browser_sign_in_context().provider
+        browser_sign_in = self._browser_sign_in_service_factory(provider)
+        try:
+            api_key = await browser_sign_in.authenticate()
+        except BrowserSignInError as e:
+            raise InternalError(str(e)) from e
+        finally:
+            await browser_sign_in.aclose()
+
+        persist_result = self._persist_api_key(
+            resolve_api_key_provider(provider), api_key
+        )
+        return AuthenticateResponse(
+            field_meta={
+                "browser-auth": {"persistResult": persist_result, "status": "completed"}
+            }
+        )
+
+    async def _start_delegated_browser_auth(self) -> AuthenticateResponse:
+        provider = self._load_enabled_browser_sign_in_context().provider
+        browser_sign_in = self._browser_sign_in_service_factory(provider)
+        try:
+            attempt = await browser_sign_in.start_attempt()
+        except BrowserSignInError as e:
+            raise InternalError(str(e)) from e
+        finally:
+            await browser_sign_in.aclose()
+
+        self._pending_browser_sign_in_attempts[attempt.process_id] = (
+            PendingBrowserSignInAttempt(attempt=attempt, provider=provider)
+        )
+        return AuthenticateResponse(
+            field_meta={
+                "browser-auth-delegated": {
+                    "attemptId": attempt.process_id,
+                    "expiresAt": (
+                        attempt.expires_at.astimezone(UTC)
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                    ),
+                    "signInUrl": attempt.sign_in_url,
+                }
+            }
+        )
+
+    async def _complete_delegated_browser_auth(
+        self, **kwargs: Any
+    ) -> AuthenticateResponse:
+        attempt_id = kwargs.get("attemptId") or kwargs.get("attempt_id")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise InvalidRequestError("Missing browser sign-in attempt ID.")
+
+        pending_attempt = self._pending_browser_sign_in_attempts.get(attempt_id)
+        if pending_attempt is None:
+            raise InvalidRequestError(f"Unknown browser sign-in attempt: {attempt_id}")
+
+        browser_sign_in = self._browser_sign_in_service_factory(
+            pending_attempt.provider
+        )
+        try:
+            api_key = await browser_sign_in.complete_attempt(pending_attempt.attempt)
+        except BrowserSignInError as e:
+            if e.code not in RETRYABLE_BROWSER_SIGN_IN_COMPLETION_ERRORS:
+                self._pending_browser_sign_in_attempts.pop(attempt_id, None)
+            raise InvalidRequestError(str(e)) from e
+        finally:
+            await browser_sign_in.aclose()
+
+        self._pending_browser_sign_in_attempts.pop(attempt_id, None)
+        persist_result = self._persist_api_key(
+            resolve_api_key_provider(pending_attempt.provider), api_key
+        )
+        return AuthenticateResponse(
+            field_meta={
+                "browser-auth-delegated": {
+                    "attemptId": attempt_id,
+                    "persistResult": persist_result,
+                    "status": "completed",
+                }
+            }
+        )
+
+    async def _authenticate_delegated_browser_auth(
+        self, **kwargs: Any
+    ) -> AuthenticateResponse:
+        action = kwargs.get("action", "start")
+        if action not in {"start", "complete"}:
+            raise InvalidRequestError(
+                f"Unsupported delegated browser auth action: {action}"
+            )
+
+        if action == "start":
+            return await self._start_delegated_browser_auth()
+
+        return await self._complete_delegated_browser_auth(**kwargs)
+
     @override
     async def authenticate(
         self, method_id: str, **kwargs: Any
     ) -> AuthenticateResponse | None:
-        raise NotImplementedMethodError("authenticate")
+        if method_id == "browser-auth":
+            return await self._authenticate_browser_auth(**kwargs)
+
+        if method_id == "browser-auth-delegated":
+            return await self._authenticate_delegated_browser_auth(**kwargs)
+
+        raise InvalidRequestError(f"Unsupported auth method: {method_id}")
 
     def _build_entrypoint_metadata(self) -> EntrypointMetadata:
-        return EntrypointMetadata(
+        return build_entrypoint_metadata(
             agent_entrypoint="acp",
             agent_version=__version__,
             client_name=self.client_info.name if self.client_info else "",
@@ -249,7 +578,7 @@ class VibeAcpAgentLoop(AcpAgent):
 
     def _load_config(self) -> VibeConfig:
         try:
-            config = VibeConfig.load(disabled_tools=["ask_user_question"])
+            config = VibeConfig.load(disabled_tools=NON_INTERACTIVE_DISABLED_TOOLS)
             config.tool_paths.extend(self._get_acp_tool_overrides())
             return config
         except MissingAPIKeyError as e:
@@ -266,16 +595,54 @@ class VibeAcpAgentLoop(AcpAgent):
         )
         self.sessions[session.id] = session
 
-        command_registry.set_on_changed(
-            lambda: self._send_available_commands(session.id)
-        )
+        async def _on_commands_changed() -> None:
+            session.spawn(self._send_available_commands(session))
 
-        if not agent_loop.auto_approve:
+        command_registry.set_on_changed(_on_commands_changed)
+
+        if not agent_loop.bypass_tool_permissions:
             agent_loop.set_approval_callback(self._create_approval_callback(session.id))
 
-        asyncio.create_task(self._send_available_commands(session.id))
+        session.spawn(self._send_available_commands(session))
+        session.spawn(self._warm_up_agent_loop(agent_loop))
 
         return session
+
+    async def _warm_up_agent_loop(self, agent_loop: AgentLoop) -> None:
+        """Proactively await deferred init so `vibe.ready` telemetry is emitted
+        without waiting for the user's first prompt. Errors are swallowed here
+        and will resurface on the first `act()` call via `requires_init`.
+        """
+        try:
+            await agent_loop.wait_until_ready()
+        except Exception:
+            pass
+
+    def _create_agent_loop(
+        self, config: VibeConfig, agent_name: str, hook_config_result: Any = None
+    ) -> AgentLoop:
+        agent_loop = AgentLoop(
+            config=config,
+            agent_name=agent_name,
+            enable_streaming=True,
+            entrypoint_metadata=self._build_entrypoint_metadata(),
+            defer_heavy_init=True,
+            hook_config_result=hook_config_result,
+        )
+        agent_loop.agent_manager.register_agent(CHAT_AGENT)
+        return agent_loop
+
+    def _build_session_state(
+        self, session: AcpSessionLoop
+    ) -> tuple[Any, Any, Any, Any]:
+        modes_state, modes_config = build_mode_state(
+            list(session.agent_loop.agent_manager.available_agents.values()),
+            session.agent_loop.agent_profile.name,
+        )
+        models_state, models_config = build_model_state(
+            session.agent_loop.config.models, session.agent_loop.config.active_model
+        )
+        return modes_state, modes_config, models_state, models_config
 
     @override
     async def new_session(
@@ -288,14 +655,11 @@ class VibeAcpAgentLoop(AcpAgent):
         os.chdir(cwd)
 
         config = self._load_config()
+        hook_config_result = load_hooks_from_fs(config)
 
         try:
-            agent_loop = AgentLoop(
-                config=config,
-                agent_name=BuiltinAgentName.DEFAULT,
-                enable_streaming=True,
-                entrypoint_metadata=self._build_entrypoint_metadata(),
-                defer_heavy_init=True,
+            agent_loop = self._create_agent_loop(
+                config, BuiltinAgentName.DEFAULT, hook_config_result=hook_config_result
             )
 
             agent_loop.agent_manager.register_agent(CHAT_AGENT)
@@ -319,11 +683,11 @@ class VibeAcpAgentLoop(AcpAgent):
             session_id=session.id,
             models=models_state,
             modes=modes_state,
-            config_options=[modes_config, models_config],
+            config_options=self._build_config_options(session),
         )
 
     def _get_acp_tool_overrides(self) -> list[Path]:
-        overrides = ["todo"]
+        overrides = ["todo", "grep", "web_fetch", "web_search", "skill", "task"]
 
         if self.client_capabilities:
             if self.client_capabilities.terminal:
@@ -354,7 +718,15 @@ class VibeAcpAgentLoop(AcpAgent):
                 case ToolOption.ALLOW_ALWAYS:
                     session.agent_loop.approve_always(tool_name, required_permissions)
                     return (ApprovalResponse.YES, None)
+                case ToolOption.ALLOW_ALWAYS_PERMANENT:
+                    session.agent_loop.approve_always(
+                        tool_name, required_permissions, save_permanently=True
+                    )
+                    return (ApprovalResponse.YES, None)
                 case ToolOption.REJECT_ONCE:
+                    session.agent_loop.telemetry_client.send_user_cancelled_action(
+                        "reject_approval"
+                    )
                     return (
                         ApprovalResponse.NO,
                         "User rejected the tool call, provide an alternative plan",
@@ -407,6 +779,29 @@ class VibeAcpAgentLoop(AcpAgent):
             raise SessionNotFoundError(session_id)
         return self.sessions[session_id]
 
+    def _find_acp_session_by_vibe_session_id(
+        self, session_id: str
+    ) -> AcpSessionLoop | None:
+        for candidate in self.sessions.values():
+            if candidate.agent_loop.session_id == session_id:
+                return candidate
+
+        return None
+
+    def _load_session_logging_config(self) -> SessionLoggingConfig:
+        try:
+            return VibeConfig.load().session_logging
+        except MissingAPIKeyError:
+            try:
+                persisted_config = VibeConfig.get_persisted_config()
+                return SessionLoggingConfig.model_validate(
+                    persisted_config.get("session_logging", {})
+                )
+            except Exception as e:
+                raise ConfigurationError(str(e)) from e
+        except Exception as e:
+            raise ConfigurationError(str(e)) from e
+
     def _build_usage(self, session: AcpSessionLoop) -> Usage:
         stats = session.agent_loop.stats
         return Usage(
@@ -438,7 +833,7 @@ class VibeAcpAgentLoop(AcpAgent):
             except Exception:
                 pass
 
-        asyncio.create_task(_send())
+        session.spawn(_send())
 
     async def _replay_tool_calls(self, session_id: str, msg: LLMMessage) -> None:
         if not msg.tool_calls:
@@ -475,9 +870,7 @@ class VibeAcpAgentLoop(AcpAgent):
                         session_id=session_id, update=result_update
                     )
 
-    async def _send_available_commands(self, session_id: str) -> None:
-        session = self._get_session(session_id)
-
+    async def _send_available_commands(self, session: AcpSessionLoop) -> None:
         commands: list[AvailableCommand] = []
 
         for cmd in session.command_registry.commands.values():
@@ -509,7 +902,7 @@ class VibeAcpAgentLoop(AcpAgent):
             )
 
         await self.client.session_update(
-            session_id=session_id, update=update_available_commands(commands)
+            session_id=session.id, update=update_available_commands(commands)
         )
 
     @override
@@ -524,6 +917,7 @@ class VibeAcpAgentLoop(AcpAgent):
         os.chdir(cwd)
 
         config = self._load_config()
+        hook_config_result = load_hooks_from_fs(config)
 
         session_dir = SessionLoader.find_session_by_id(
             session_id, config.session_logging
@@ -532,42 +926,36 @@ class VibeAcpAgentLoop(AcpAgent):
             raise SessionNotFoundError(session_id)
 
         try:
-            loaded_messages, _ = SessionLoader.load_session(session_dir)
+            loaded_messages, metadata = SessionLoader.load_session(session_dir)
         except Exception as e:
             raise SessionLoadError(session_id, str(e)) from e
 
-        agent_loop = AgentLoop(
-            config=config,
-            agent_name=BuiltinAgentName.DEFAULT,
-            enable_streaming=True,
-            entrypoint_metadata=self._build_entrypoint_metadata(),
-            defer_heavy_init=True,
+        agent_loop = self._create_agent_loop(
+            config, BuiltinAgentName.DEFAULT, hook_config_result=hook_config_result
         )
-        agent_loop.agent_manager.register_agent(CHAT_AGENT)
+        loaded_session_id = metadata.get("session_id", agent_loop.session_id)
+        agent_loop.session_id = loaded_session_id
+        agent_loop.parent_session_id = metadata.get("parent_session_id")
+        agent_loop.session_logger.resume_existing_session(
+            loaded_session_id, session_dir
+        )
+        await agent_loop.hydrate_experiments_from_session()
 
         non_system_messages = [
             msg for msg in loaded_messages if msg.role != Role.system
         ]
-
-        agent_loop.messages.extend(non_system_messages)
-
+        if non_system_messages:
+            agent_loop.messages.extend(non_system_messages)
         session = await self._create_acp_session(session_id, agent_loop)
-
-        await self._replay_conversation_history(session_id, non_system_messages)
+        await self._replay_conversation_history(session.id, non_system_messages)
         self._send_usage_update(session)
 
-        modes_state, modes_config = make_mode_response(
-            list(agent_loop.agent_manager.available_agents.values()),
-            session.agent_loop.agent_profile.name,
-        )
-        models_state, models_config = make_model_response(
-            agent_loop.config.models, agent_loop.config.active_model
-        )
+        modes_state, _, models_state, _ = self._build_session_state(session)
 
         return LoadSessionResponse(
             models=models_state,
             modes=modes_state,
-            config_options=[modes_config, models_config],
+            config_options=self._build_config_options(session),
         )
 
     async def _apply_mode_change(self, session: AcpSessionLoop, mode_id: str) -> bool:
@@ -577,7 +965,7 @@ class VibeAcpAgentLoop(AcpAgent):
 
         await session.agent_loop.switch_agent(mode_id)
 
-        if session.agent_loop.auto_approve:
+        if session.agent_loop.bypass_tool_permissions:
             session.agent_loop.approval_callback = None
         else:
             session.agent_loop.set_approval_callback(
@@ -586,20 +974,27 @@ class VibeAcpAgentLoop(AcpAgent):
 
         return True
 
+    async def _reload_config(self, session: AcpSessionLoop) -> None:
+        new_config = VibeConfig.load(
+            tool_paths=session.agent_loop.config.tool_paths,
+            disabled_tools=NON_INTERACTIVE_DISABLED_TOOLS,
+        )
+        await session.agent_loop.reload_with_initial_messages(base_config=new_config)
+
     async def _apply_model_change(self, session: AcpSessionLoop, model_id: str) -> bool:
         model_aliases = [model.alias for model in session.agent_loop.config.models]
         if model_id not in model_aliases:
             return False
 
         VibeConfig.save_updates({"active_model": model_id})
+        await self._reload_config(session)
+        return True
 
-        new_config = VibeConfig.load(
-            tool_paths=session.agent_loop.config.tool_paths,
-            disabled_tools=["ask_user_question"],
-        )
-
-        await session.agent_loop.reload_with_initial_messages(base_config=new_config)
-
+    async def _apply_thinking_change(
+        self, session: AcpSessionLoop, level: ThinkingLevel
+    ) -> bool:
+        session.agent_loop.config.set_thinking(level)
+        await self._reload_config(session)
         return True
 
     @override
@@ -635,6 +1030,10 @@ class VibeAcpAgentLoop(AcpAgent):
                 success = await self._apply_mode_change(session, value)
             case "model" if isinstance(value, str):
                 success = await self._apply_model_change(session, value)
+            case "thinking" if isinstance(value, str) and value in THINKING_LEVELS:
+                success = await self._apply_thinking_change(
+                    session, cast(ThinkingLevel, value)
+                )
             case _:
                 success = False
 
@@ -681,7 +1080,7 @@ class VibeAcpAgentLoop(AcpAgent):
     ) -> PromptResponse:
         session = self._get_session(session_id)
 
-        if session.task is not None:
+        if session.prompt_task is not None:
             raise InvalidRequestError(
                 "Concurrent prompts are not supported yet, wait for agent loop to finish"
             )
@@ -705,15 +1104,21 @@ class VibeAcpAgentLoop(AcpAgent):
             )
             text_prompt = SkillManager.build_skill_prompt(text_prompt, skill)
 
+        auto_title: str | None = None
+        if session.agent_loop.session_logger.needs_initial_auto_title():
+            auto_title = (
+                format_session_title(acp_blocks_to_title_segments(prompt)) or None
+            )
+
         async def agent_loop_task() -> None:
             async for update in self._run_agent_loop(
-                session, text_prompt, resolved_message_id
+                session, text_prompt, resolved_message_id, auto_title=auto_title
             ):
                 await self.client.session_update(session_id=session.id, update=update)
 
         try:
-            session.task = asyncio.create_task(agent_loop_task())
-            await session.task
+            task = session.set_prompt_task(agent_loop_task())
+            await task
 
         except asyncio.CancelledError:
             self._send_usage_update(session)
@@ -726,25 +1131,50 @@ class VibeAcpAgentLoop(AcpAgent):
         except CoreRateLimitError as e:
             raise RateLimitError.from_core(e) from e
 
+        except CoreContextTooLongError as e:
+            raise ContextTooLongError.from_core(e) from e
+
         except ConversationLimitException as e:
             raise ConversationLimitError(str(e)) from e
 
         except Exception as e:
             raise InternalError(str(e)) from e
 
-        finally:
-            session.task = None
-
         self._send_usage_update(session)
+        meta = self._build_end_turn_meta(session)
         return PromptResponse(
             stop_reason="end_turn",
             usage=self._build_usage(session),
             user_message_id=resolved_message_id,
+            field_meta=meta or None,
         )
 
+    def _build_end_turn_meta(self, session: AcpSessionLoop) -> dict[str, Any] | None:
+        agent_loop = session.agent_loop
+        user_message_count = (
+            sum(m.role == Role.user and not m.injected for m in agent_loop.messages) + 1
+        )  # +1 for the message just sent
+        if not should_show_feedback(
+            telemetry_active=agent_loop.telemetry_client.is_active(),
+            is_mistral_model=agent_loop.config.is_active_model_mistral(),
+            user_message_count=user_message_count,
+        ):
+            return None
+        record_feedback_asked()
+        return {"show_feedback_prompt": True}
+
     def _build_text_prompt(self, acp_prompt: list[ContentBlock]) -> str:
+        def _is_automatic_resource(block: ContentBlock) -> bool:
+            return block.type == "resource" and bool(
+                block.field_meta and block.field_meta.get("automatic")
+            )
+
+        ordered = [b for b in acp_prompt if not _is_automatic_resource(b)] + [
+            b for b in acp_prompt if _is_automatic_resource(b)
+        ]
+
         text_prompt = ""
-        for block in acp_prompt:
+        for block in ordered:
             separator = "\n\n" if text_prompt else ""
             match block.type:
                 # NOTE: ACP supports annotations, but we don't use them here yet.
@@ -802,19 +1232,34 @@ class VibeAcpAgentLoop(AcpAgent):
         if command is None:
             return None
 
+        session.agent_loop.telemetry_client.send_slash_command_used(cmd_name, "builtin")
         handler = getattr(self, command.handler)
         return await handler(session, text_prompt, message_id)
 
     async def _run_agent_loop(
-        self, session: AcpSessionLoop, prompt: str, client_message_id: str | None = None
-    ) -> AsyncGenerator[SessionUpdate]:
+        self,
+        session: AcpSessionLoop,
+        prompt: str,
+        client_message_id: str | None = None,
+        *,
+        auto_title: str | None = None,
+    ) -> AsyncGenerator[SessionUpdate | UsageUpdate]:
         rendered_prompt = render_path_prompt(prompt, base_dir=Path.cwd())
 
         async with aclosing(
-            session.agent_loop.act(rendered_prompt, client_message_id=client_message_id)
+            session.agent_loop.act(
+                rendered_prompt,
+                client_message_id=client_message_id,
+                auto_title=auto_title,
+            )
         ) as events:
             async for event in events:
-                if isinstance(event, AssistantEvent):
+                if isinstance(event, SessionTitleUpdatedEvent):
+                    await self._emit_session_info_update(
+                        session.id, title=event.title, updated_at=None
+                    )
+
+                elif isinstance(event, AssistantEvent):
                     yield AgentMessageChunk(
                         session_update="agent_message_chunk",
                         content=TextContentBlock(type="text", text=event.content),
@@ -834,7 +1279,6 @@ class VibeAcpAgentLoop(AcpAgent):
                             tool_manager=session.agent_loop.tool_manager,
                             client=self.client,
                             session_id=session.id,
-                            tool_call_id=event.tool_call_id,
                         )
 
                     session_update = tool_call_session_update(event)
@@ -845,11 +1289,29 @@ class VibeAcpAgentLoop(AcpAgent):
                     session_update = tool_result_session_update(event)
                     if session_update:
                         yield session_update
+                    self._send_usage_update(session)
+
+                elif isinstance(event, ToolTerminalOpenedEvent):
+                    # bash yielded the terminal id; surface it as an
+                    # in_progress update carrying the terminal block.
+                    yield ToolCallProgress(
+                        session_update="tool_call_update",
+                        tool_call_id=event.tool_call_id,
+                        status="in_progress",
+                        kind=resolve_kind(event.tool_name),
+                        content=[
+                            TerminalToolCallContent(
+                                type="terminal", terminal_id=event.terminal_id
+                            )
+                        ],
+                        field_meta={"tool_name": event.tool_name},
+                    )
 
                 elif isinstance(event, ToolStreamEvent):
                     yield ToolCallProgress(
                         session_update="tool_call_update",
                         tool_call_id=event.tool_call_id,
+                        kind=resolve_kind(event.tool_name),
                         content=[
                             ContentToolCallContent(
                                 type="content",
@@ -858,6 +1320,7 @@ class VibeAcpAgentLoop(AcpAgent):
                                 ),
                             )
                         ],
+                        field_meta={"tool_name": event.tool_name},
                     )
 
                 elif isinstance(event, CompactStartEvent):
@@ -873,14 +1336,40 @@ class VibeAcpAgentLoop(AcpAgent):
     async def close_session(
         self, session_id: str, **kwargs: Any
     ) -> CloseSessionResponse | None:
-        raise NotImplementedMethodError("close_session")
+        session = self._get_session(session_id)
+        self.sessions.pop(session_id, None)
+
+        session.agent_loop.emit_session_closed_telemetry()
+        await session.close()
+        await self._close_agent_loop(session.agent_loop)
+
+        return CloseSessionResponse()
+
+    async def emit_session_closed_for_active_sessions(self) -> None:
+        agent_loops = [session.agent_loop for session in self.sessions.values()]
+        for agent_loop in agent_loops:
+            agent_loop.telemetry_client._client = None
+            agent_loop.emit_session_closed_telemetry()
+        await asyncio.gather(
+            *(agent_loop.telemetry_client.aclose() for agent_loop in agent_loops),
+            return_exceptions=True,
+        )
+
+    async def _close_agent_loop(self, agent_loop: AgentLoop) -> None:
+        deferred_init_thread = agent_loop._deferred_init_thread
+        if deferred_init_thread is not None and deferred_init_thread.is_alive():
+            await asyncio.to_thread(deferred_init_thread.join)
+
+        await agent_loop.aclose()
+        await agent_loop.telemetry_client.aclose()
 
     @override
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         session = self._get_session(session_id)
-        if session.task and not session.task.done():
-            session.task.cancel()
-            session.task = None
+        session.agent_loop.telemetry_client.send_user_cancelled_action(
+            "interrupt_agent"
+        )
+        await session.cancel_prompt()
 
     @override
     async def fork_session(
@@ -890,7 +1379,41 @@ class VibeAcpAgentLoop(AcpAgent):
         mcp_servers: list[HttpMcpServer | SseMcpServer | McpServerStdio] | None = None,
         **kwargs: Any,
     ) -> ForkSessionResponse:
-        raise NotImplementedMethodError("fork_session")
+        load_dotenv_values()
+        os.chdir(cwd)
+
+        source_session = self._get_session(session_id)
+        try:
+            message_id = ForkSessionParams.model_validate(kwargs).message_id
+        except ValidationError as e:
+            raise InvalidRequestError(f"Invalid fork parameters: {e}") from e
+        if (
+            source_session.prompt_task is not None
+            and not source_session.prompt_task.done()
+        ):
+            raise InvalidRequestError(
+                "Cannot fork a session while the agent loop is running"
+            )
+
+        try:
+            agent_loop = await source_session.agent_loop.fork(message_id)
+            agent_loop.agent_manager.register_agent(CHAT_AGENT)
+            session = await self._create_acp_session(agent_loop.session_id, agent_loop)
+        except InvalidRequestError:
+            raise
+        except ValueError as e:
+            raise InvalidRequestError(str(e)) from e
+        except Exception as e:
+            raise ConfigurationError(str(e)) from e
+
+        modes_state, _, models_state, _ = self._build_session_state(session)
+
+        return ForkSessionResponse(
+            session_id=session.id,
+            models=models_state,
+            modes=modes_state,
+            config_options=self._build_config_options(session),
+        )
 
     @override
     async def resume_session(
@@ -902,13 +1425,186 @@ class VibeAcpAgentLoop(AcpAgent):
     ) -> ResumeSessionResponse:
         raise NotImplementedMethodError("resume_session")
 
+    async def _emit_session_info_update(
+        self, session_id: str, *, title: str, updated_at: str | None
+    ) -> None:
+        update_kwargs: dict[str, Any] = {
+            "session_update": "session_info_update",
+            "title": title,
+        }
+        if updated_at is not None:
+            update_kwargs["updated_at"] = updated_at
+
+        await self.client.session_update(
+            session_id=session_id, update=SessionInfoUpdate(**update_kwargs)
+        )
+
+    async def _persist_live_session_title(
+        self, session: AcpSessionLoop, title: str
+    ) -> dict[str, Any] | None:
+        logger = session.agent_loop.session_logger
+        if not logger.enabled or logger.session_dir is None:
+            return None
+        if not logger.metadata_filepath.exists():
+            return None
+
+        try:
+            return await update_saved_session_title_at_path(logger.session_dir, title)
+        except ValueError as exc:
+            raise InternalError(
+                f"Failed to persist title update for session {logger.session_id}: {exc}"
+            ) from exc
+
+    def _set_live_session_title(self, session: AcpSessionLoop, title: str) -> None:
+        try:
+            session.agent_loop.session_logger.set_title(title)
+        except ValueError as exc:
+            raise InvalidRequestError(
+                f"Invalid ACP session title request: {exc}"
+            ) from exc
+
+    async def _handle_session_set_title(self, params: dict[str, Any]) -> dict[str, Any]:
+        try:
+            request = SessionSetTitleRequest.model_validate(params)
+        except ValidationError as exc:
+            raise InvalidRequestError(
+                f"Invalid ACP session title request: {exc}"
+            ) from exc
+
+        live_session = self.sessions.get(
+            request.session_id
+        ) or self._find_acp_session_by_vibe_session_id(request.session_id)
+        if live_session is None:
+            try:
+                metadata = await update_saved_session_title(
+                    request.session_id,
+                    request.title,
+                    self._load_session_logging_config(),
+                )
+            except ValueError as exc:
+                raise SessionNotFoundError(request.session_id) from exc
+
+            await self._emit_session_info_update(
+                request.session_id,
+                title=request.title,
+                updated_at=metadata.get("end_time"),
+            )
+            return {}
+
+        persisted_metadata = await self._persist_live_session_title(
+            live_session, request.title
+        )
+        self._set_live_session_title(live_session, request.title)
+        updated_at = (
+            persisted_metadata.get("end_time")
+            if persisted_metadata is not None
+            else (
+                live_session.agent_loop.session_logger.session_metadata.end_time
+                if live_session.agent_loop.session_logger.session_metadata is not None
+                else None
+            )
+        )
+
+        await self._emit_session_info_update(
+            live_session.id, title=request.title, updated_at=updated_at
+        )
+        return {}
+
+    def _assess_current_auth_state(self) -> tuple[ProviderConfig, AuthState]:
+        load_dotenv_values(env_path=GLOBAL_ENV_FILE.path)
+        provider = self._load_onboarding_context().provider
+        auth_state = assess_auth_state(
+            provider,
+            process_env_had_value_before_dotenv_load=bool(
+                provider.api_key_env_var
+                and self._environ_before_dotenv_load.get(provider.api_key_env_var)
+            ),
+        )
+        return provider, auth_state
+
+    def _process_env_value_before_dotenv_load(
+        self, provider: ProviderConfig
+    ) -> str | None:
+        if not provider.api_key_env_var:
+            return None
+
+        return self._environ_before_dotenv_load.get(provider.api_key_env_var)
+
+    def _handle_auth_status(self) -> dict[str, Any]:
+        _, auth_state = self._assess_current_auth_state()
+        return _auth_status_response_from_auth_state(auth_state).model_dump(
+            mode="json", by_alias=True
+        )
+
+    def _handle_auth_sign_out(self) -> dict[str, Any]:
+        provider, auth_state = self._assess_current_auth_state()
+        if not auth_state.sign_out_available:
+            raise InvalidRequestError(
+                f"Sign out is not available for auth state: {auth_state.kind.value}"
+            )
+
+        try:
+            self._remove_api_key(provider)
+            if (
+                auth_state.kind
+                == AuthStateKind.VIBE_HOME_ENV_FILE_OVERRIDES_PROCESS_ENV
+                and auth_state.env_key
+            ):
+                process_env_value = self._process_env_value_before_dotenv_load(provider)
+                if process_env_value:
+                    os.environ[auth_state.env_key] = process_env_value
+        except (OSError, ValueError) as exc:
+            raise InternalError(f"Failed to sign out: {exc}") from exc
+
+        return {}
+
     @override
     async def ext_method(self, method: str, params: dict) -> dict:
-        raise NotImplementedMethodError("ext_method")
+        if method == "auth/status":
+            return self._handle_auth_status()
+
+        if method == "auth/signOut":
+            return self._handle_auth_sign_out()
+
+        if method == "session/set_title":
+            return await self._handle_session_set_title(params)
+
+        raise NotImplementedMethodError(method)
 
     @override
     async def ext_notification(self, method: str, params: dict) -> None:
-        raise NotImplementedMethodError("ext_notification")
+        # ACP strips the leading "_" before delegating extension notifications here.
+        if method == "telemetry/send":
+            self._handle_telemetry_notification(params)
+
+    def _handle_telemetry_notification(self, params: dict[str, Any]) -> None:
+        try:
+            notification = TelemetrySendNotification.model_validate(params)
+        except ValidationError as exc:
+            raise InvalidRequestError(
+                f"Invalid ACP telemetry notification: {exc}"
+            ) from exc
+
+        session = self.sessions.get(notification.session_id)
+        if session is None:
+            logger.warning(
+                "Ignoring ACP telemetry notification because session could not be resolved: %s",
+                notification.session_id,
+            )
+            return
+
+        dispatcher = _EVENT_DISPATCHERS.get(notification.event)
+        if dispatcher is None:
+            logger.warning(
+                "Ignoring unsupported ACP telemetry event: %s", notification.event
+            )
+            return
+
+        properties = {
+            "model": session.agent_loop.config.active_model,
+            **notification.properties,
+        }
+        dispatcher(session.agent_loop.telemetry_client, properties)
 
     @override
     def on_connect(self, conn: Client) -> None:
@@ -961,6 +1657,9 @@ class VibeAcpAgentLoop(AcpAgent):
 
         tool_call_id = str(uuid4())
         old_tokens = session.agent_loop.stats.context_tokens
+        old_session_id = session.agent_loop.session_id
+        parts = text_prompt.strip().split(None, 1)
+        cmd_args = parts[1] if len(parts) > 1 else ""
 
         start_event = CompactStartEvent(
             current_context_tokens=old_tokens or 0,
@@ -972,13 +1671,12 @@ class VibeAcpAgentLoop(AcpAgent):
             update=create_compact_start_session_update(start_event),
         )
 
-        await session.agent_loop.compact()
-        new_tokens = session.agent_loop.stats.context_tokens
+        await session.agent_loop.compact(extra_instructions=cmd_args.strip())
 
         end_event = CompactEndEvent(
-            old_context_tokens=old_tokens or 0,
-            new_context_tokens=new_tokens or 0,
             summary_length=0,
+            old_session_id=old_session_id,
+            new_session_id=session.agent_loop.session_id,
             tool_call_id=tool_call_id,
         )
         await self.client.session_update(
@@ -991,7 +1689,7 @@ class VibeAcpAgentLoop(AcpAgent):
         """Reload config from disk and reinitialize the agent loop."""
         new_config = VibeConfig.load(
             tool_paths=session.agent_loop.config.tool_paths,
-            disabled_tools=["ask_user_question"],
+            disabled_tools=NON_INTERACTIVE_DISABLED_TOOLS,
         )
         await session.agent_loop.reload_with_initial_messages(base_config=new_config)
 
@@ -1069,13 +1767,16 @@ class VibeAcpAgentLoop(AcpAgent):
     ) -> list[SessionConfigOptionSelect | SessionConfigOptionBoolean]:
         """Build the current modes + models config options for a session."""
         profiles = list(session.agent_loop.agent_manager.available_agents.values())
-        _, modes_config = make_mode_response(
+        _, modes_config = build_mode_state(
             profiles, session.agent_loop.agent_profile.name
         )
-        _, models_config = make_model_response(
+        _, models_config = build_model_state(
             session.agent_loop.config.models, session.agent_loop.config.active_model
         )
-        return [modes_config, models_config]
+        thinking_config = make_thinking_response(
+            session.agent_loop.config.get_active_model().thinking
+        )
+        return [modes_config, models_config, thinking_config]
 
     async def _send_config_option_update(self, session: AcpSessionLoop) -> None:
         """Push updated config options (modes, models) to the client."""
@@ -1127,19 +1828,50 @@ class VibeAcpAgentLoop(AcpAgent):
         return await self._command_reply(session, DATA_RETENTION_MESSAGE, message_id)
 
 
-def run_acp_server() -> None:
+SESSION_CLOSED_FLUSH_TIMEOUT_SECONDS = 1.0
+
+
+def run_acp_server(
+    *, environ_before_dotenv_load: Mapping[str, str] | None = None
+) -> None:
+    agent = VibeAcpAgentLoop(environ_before_dotenv_load=environ_before_dotenv_load)
+    install_sigterm_flush = TelemetryClient(config_getter=VibeConfig.load).is_active()
+    received_sigterm = False
+    previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
+
+    def _handle_sigterm(_signum: int, _frame: Any) -> None:
+        nonlocal received_sigterm
+        received_sigterm = True
+        raise KeyboardInterrupt
+
+    if install_sigterm_flush:
+        signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
         asyncio.run(
             run_agent(
-                agent=VibeAcpAgentLoop(),
+                agent=agent,
                 use_unstable_protocol=True,
                 observers=[acp_message_observer],
             )
         )
     except KeyboardInterrupt:
+        if received_sigterm:
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)
+            try:
+                asyncio.run(
+                    asyncio.wait_for(
+                        agent.emit_session_closed_for_active_sessions(),
+                        timeout=SESSION_CLOSED_FLUSH_TIMEOUT_SECONDS,
+                    )
+                )
+            except (TimeoutError, Exception):
+                pass
         # This is expected when the server is terminated
         pass
     except Exception as e:
         # Log any unexpected errors
         print(f"ACP Agent Server error: {e}", file=sys.stderr)
         raise
+    finally:
+        if install_sigterm_flush:
+            signal.signal(signal.SIGTERM, previous_sigterm_handler)

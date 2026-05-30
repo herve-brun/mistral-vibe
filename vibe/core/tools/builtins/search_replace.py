@@ -11,6 +11,7 @@ import anyio
 from pydantic import BaseModel, Field
 
 from vibe.core.rewind.manager import FileSnapshot
+from vibe.core.scratchpad import is_scratchpad_path
 from vibe.core.tools.base import (
     BaseTool,
     BaseToolConfig,
@@ -90,9 +91,10 @@ class SearchReplace(
 
     @classmethod
     def format_call_display(cls, args: SearchReplaceArgs) -> ToolCallDisplay:
+        tag = " (scratchpad)" if is_scratchpad_path(args.file_path) else ""
         blocks = cls._parse_search_replace_blocks(args.content)
         return ToolCallDisplay(
-            summary=f"Patching {args.file_path} ({len(blocks)} blocks)",
+            summary=f"Patching {args.file_path} ({len(blocks)} blocks){tag}",
             content=args.content,
         )
 
@@ -100,9 +102,10 @@ class SearchReplace(
     def get_result_display(cls, event: ToolResultEvent) -> ToolResultDisplay:
         if isinstance(event.result, SearchReplaceResult):
             path_name = Path(event.result.file).name
+            tag = " (scratchpad)" if is_scratchpad_path(event.result.file) else ""
             return ToolResultDisplay(
                 success=True,
-                message=f"Applied {event.result.blocks_applied} block{'' if event.result.blocks_applied == 1 else 's'} to {path_name}",
+                message=f"Applied {event.result.blocks_applied} block{'' if event.result.blocks_applied == 1 else 's'} to {path_name}{tag}",
                 warnings=event.result.warnings,
             )
 
@@ -167,7 +170,9 @@ class SearchReplace(
             except Exception:
                 pass
 
-            await self._write_file(file_path, modified_content, decoded.encoding)
+            await self._write_file(
+                file_path, modified_content, decoded.encoding, decoded.newline
+            )
 
         yield SearchReplaceResult(
             file=str(file_path),
@@ -235,10 +240,12 @@ class SearchReplace(
     async def _backup_file(self, file_path: Path) -> None:
         shutil.copy2(file_path, file_path.with_suffix(file_path.suffix + ".bak"))
 
-    async def _write_file(self, file_path: Path, content: str, encoding: str) -> None:
+    async def _write_file(
+        self, file_path: Path, content: str, encoding: str, newline: str
+    ) -> None:
         try:
             async with await anyio.Path(file_path).open(
-                mode="w", encoding=encoding
+                mode="w", encoding=encoding, newline=newline
             ) as f:
                 await f.write(content)
         except UnicodeEncodeError as e:

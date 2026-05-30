@@ -1,16 +1,26 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+import asyncio
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, ClassVar, cast
+
+from vibe.core.hooks.models import HookMessageSeverity
+from vibe.core.logger import logger
+from vibe.core.utils.io import read_safe_async
 
 if TYPE_CHECKING:
     from vibe.cli.textual_ui.app import ChatScroll
 
+
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Static
+from textual.css.query import NoMatches
+from textual.reactive import reactive
+from textual.widget import Widget
+from textual.widgets import Markdown, Static
 from textual.widgets._markdown import MarkdownStream
+from watchfiles import awatch
 
-from vibe.cli.textual_ui.ansi_markdown import AnsiMarkdown as Markdown
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from vibe.cli.textual_ui.widgets.spinner import SpinnerMixin, SpinnerType
 
@@ -37,7 +47,20 @@ class ExpandingBorder(NonSelectableStatic):
         self.refresh()
 
 
+# Mimic a border bottom with this component in order to have dimmed colors in ANSI themes
+# Move back to border when Textual supports dimmed borders or foreground-muted in ANSI themes
+class ExpandingSeparator(NonSelectableStatic):
+    def render(self) -> str:
+        return "─" * max(self.size.width, 1)
+
+    def on_resize(self) -> None:
+        self.refresh()
+
+
 class UserMessage(Static):
+    PROMPT_CHAR: ClassVar[str] = ">"
+    SHOW_SEPARATOR: ClassVar[bool] = True
+
     def __init__(
         self, content: str, pending: bool = False, message_index: int | None = None
     ) -> None:
@@ -51,10 +74,16 @@ class UserMessage(Static):
         return self._content
 
     def compose(self) -> ComposeResult:
-        with Horizontal(classes="user-message-container"):
-            yield NoMarkupStatic(self._content, classes="user-message-content")
-            if self._pending:
-                self.add_class("pending")
+        with Vertical(classes="user-message-wrapper"):
+            with Horizontal(classes="user-message-container"):
+                yield NonSelectableStatic(
+                    f"{self.PROMPT_CHAR} ", classes="user-message-prompt"
+                )
+                yield NoMarkupStatic(self._content, classes="user-message-content")
+            if self.SHOW_SEPARATOR:
+                yield ExpandingSeparator(classes="user-message-separator")
+        if self._pending:
+            self.add_class("pending")
 
     async def set_pending(self, pending: bool) -> None:
         if pending == self._pending:
@@ -67,6 +96,19 @@ class UserMessage(Static):
             return
 
         self.remove_class("pending")
+
+
+class SlashCommandMessage(UserMessage):
+    PROMPT_CHAR = "/"
+    SHOW_SEPARATOR = False
+
+    def __init__(self, content: str) -> None:
+        super().__init__(content)
+        self.add_class("slash-command-message")
+
+
+class TeleportUserMessage(UserMessage):
+    PROMPT_CHAR = "&"
 
 
 class StreamingMessageBase(Static):
@@ -138,6 +180,9 @@ class StreamingMessageBase(Static):
 
     def _should_write_content(self) -> bool:
         return True
+
+    def get_content(self) -> str:
+        return self._content
 
     def is_stripped_content_empty(self) -> bool:
         return self._content.strip() == ""
@@ -234,10 +279,29 @@ class UserCommandMessage(Static):
                 yield Markdown(self._content)
 
 
+VSCODE_EXTENSION_URI = "vscode:extension/mistralai.mistral-vibe-code"
+VSCODE_EXTENSION_LINK_LABEL = "VS Code extension"
+VSCODE_EXTENSION_PROMO_STANDALONE = f"We now have a [{VSCODE_EXTENSION_LINK_LABEL}]({VSCODE_EXTENSION_URI}) with a rich UI. Check it out!"
+VSCODE_EXTENSION_PROMO_WHATS_NEW_SUFFIX = (
+    f"\n\n_Btw, we also have a new [{VSCODE_EXTENSION_LINK_LABEL}]"
+    f"({VSCODE_EXTENSION_URI}). Check it out!_"
+)
+
+
 class WhatsNewMessage(Static):
     def __init__(self, content: str) -> None:
         super().__init__()
         self.add_class("whats-new-message")
+        self._content = content
+
+    def compose(self) -> ComposeResult:
+        yield Markdown(self._content)
+
+
+class VscodeExtensionPromoMessage(Static):
+    def __init__(self, content: str = VSCODE_EXTENSION_PROMO_STANDALONE) -> None:
+        super().__init__()
+        self.add_class("vscode-extension-promo-message")
         self._content = content
 
     def compose(self) -> ComposeResult:
@@ -258,24 +322,110 @@ class InterruptMessage(Static):
             )
 
 
-class BashOutputMessage(Static):
-    def __init__(self, command: str, cwd: str, output: str, exit_code: int) -> None:
+class BashOutputMessage(SpinnerMixin, Static):
+    SPINNER_TYPE = SpinnerType.PULSE
+
+    def __init__(
+        self,
+        command: str,
+        cwd: str,
+        output: str = "",
+        exit_code: int = 0,
+        *,
+        pending: bool = False,
+    ) -> None:
         super().__init__()
+        self.init_spinner()
         self.add_class("bash-output-message")
         self._command = command
         self._cwd = cwd
         self._output = output.rstrip("\n")
         self._exit_code = exit_code
+        self._pending = pending
+        self._output_widget: NoMarkupStatic | None = None
+        self._output_container: Horizontal | None = None
+        self._prompt_widget: NonSelectableStatic | None = None
+        self._indicator_widget: Static | None = None
+
+    def _update_spinner_frame(self) -> None:
+        if not self._is_spinning or not self._prompt_widget:
+            return
+        self._prompt_widget.update(f"{self._spinner.next_frame()} ")
+
+    def on_mount(self) -> None:
+        if self._pending:
+            self.start_spinner_timer()
 
     def compose(self) -> ComposeResult:
-        status_class = "bash-success" if self._exit_code == 0 else "bash-error"
+        if self._pending:
+            status_class = "bash-pending"
+        elif self._exit_code != 0:
+            status_class = "bash-error"
+        else:
+            status_class = "bash-success"
         self.add_class(status_class)
+        prompt_text = f"{self._spinner.current_frame()} " if self._pending else "$ "
         with Horizontal(classes="bash-command-line"):
-            yield NonSelectableStatic("$ ", classes=f"bash-prompt {status_class}")
+            self._prompt_widget = NonSelectableStatic(
+                prompt_text, classes=f"bash-prompt {status_class}"
+            )
+            yield self._prompt_widget
             yield NoMarkupStatic(self._command, classes="bash-command")
-        with Horizontal(classes="bash-output-container"):
-            yield ExpandingBorder(classes="bash-output-border")
-            yield NoMarkupStatic(self._output, classes="bash-output")
+        if not self._pending:
+            self._output_container = Horizontal(classes="bash-output-container")
+            with self._output_container:
+                yield ExpandingBorder(classes="bash-output-border")
+                self._output_widget = NoMarkupStatic(
+                    self._output, classes="bash-output"
+                )
+                yield self._output_widget
+
+    async def _ensure_output_container(self) -> None:
+        if self._output_container is not None:
+            return
+        self._output_widget = NoMarkupStatic("", classes="bash-output")
+        self._output_container = Horizontal(
+            ExpandingBorder(classes="bash-output-border"),
+            self._output_widget,
+            classes="bash-output-container",
+        )
+        await self.mount(self._output_container)
+
+    async def append_output(self, text: str) -> None:
+        await self._ensure_output_container()
+        self._output += text
+        if self._output_widget:
+            self._output_widget.update(self._output.rstrip("\n"))
+
+    async def finish(self, exit_code: int, *, interrupted: bool = False) -> None:
+        self._exit_code = exit_code
+        self._pending = False
+        self.stop_spinning()
+        if self._prompt_widget:
+            self._prompt_widget.update("$ ")
+        if interrupted:
+            new_class = "bash-interrupted"
+        elif exit_code != 0:
+            new_class = "bash-error"
+        else:
+            new_class = "bash-success"
+        self.remove_class("bash-pending")
+        self.add_class(new_class)
+        if self._prompt_widget:
+            self._prompt_widget.remove_class("bash-pending")
+            self._prompt_widget.add_class(new_class)
+        if interrupted:
+            suffix = (
+                "\n(interrupted)"
+                if self._output and not self._output.endswith("\n")
+                else "(interrupted)"
+            )
+            self._output += suffix
+        if not self._output:
+            self._output = "(no output)"
+        await self._ensure_output_container()
+        if self._output_widget:
+            self._output_widget.update(self._output.rstrip("\n"))
 
 
 class ErrorMessage(Static):
@@ -298,6 +448,48 @@ class ErrorMessage(Static):
         pass
 
 
+class HookRunContainer(Vertical):
+    def __init__(self) -> None:
+        super().__init__(classes="hook-run-container")
+        self.display = False
+
+    async def add_message(self, widget: HookSystemMessageLine) -> None:
+        await self.mount(widget)
+        self.display = True
+
+
+_HOOK_SEVERITY_ICONS: dict[HookMessageSeverity, str] = {
+    HookMessageSeverity.OK: "✓",
+    HookMessageSeverity.WARNING: "⚠",
+    HookMessageSeverity.ERROR: "✗",
+}
+
+
+class HookSystemMessageLine(Static):
+    def __init__(
+        self,
+        hook_name: str,
+        content: str,
+        severity: HookMessageSeverity = HookMessageSeverity.WARNING,
+    ) -> None:
+        super().__init__()
+        self.add_class("hook-system-message")
+        self.add_class(f"hook-severity-{severity}")
+        self._hook_name = hook_name
+        self._content = content
+        self._severity = severity
+
+    def compose(self) -> ComposeResult:
+        icon = _HOOK_SEVERITY_ICONS.get(
+            self._severity, _HOOK_SEVERITY_ICONS[HookMessageSeverity.WARNING]
+        )
+        with Horizontal(classes="hook-system-container"):
+            yield NonSelectableStatic(icon, classes="hook-system-icon")
+            yield NoMarkupStatic(
+                f"[{self._hook_name}] {self._content}", classes="hook-system-content"
+            )
+
+
 class WarningMessage(Static):
     def __init__(self, message: str, show_border: bool = True) -> None:
         super().__init__()
@@ -310,3 +502,60 @@ class WarningMessage(Static):
             if self._show_border:
                 yield ExpandingBorder(classes="warning-border")
             yield NoMarkupStatic(self._message, classes="warning-content")
+
+
+class PlanFileMessage(Widget):
+    content: reactive[str] = reactive("")
+
+    def __init__(self, file_path: Path) -> None:
+        super().__init__()
+        self.add_class("plan-file-message")
+        self._file_path = file_path
+        self._watch_task: asyncio.Task | None = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="plan-file-wrapper"):
+            yield Markdown(self.content, classes="plan-file-content")
+
+    def watch_content(self, new_content: str) -> None:
+        try:
+            self.query_one(Markdown).update(new_content)
+        except NoMatches:
+            pass
+
+    async def on_mount(self) -> None:
+        self.content = (await read_safe_async(self._file_path)).text
+        self._watch_task = asyncio.create_task(self._watch_file())
+
+    async def _watch_file(self) -> None:
+        try:
+            async for _ in awatch(self._file_path):
+                self.content = (await read_safe_async(self._file_path)).text
+        except (asyncio.CancelledError, FileNotFoundError):
+            pass
+
+    def open_in_editor(self) -> None:
+        from vibe.cli.textual_ui.external_editor import ExternalEditor
+
+        try:
+            self._file_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.app.suspend():
+                ExternalEditor.edit_file(self._file_path)
+        except OSError:
+            logger.warning(
+                "Failed to open plan file in editor: %s", self._file_path, exc_info=True
+            )
+            self.app.notify(
+                f"Could not open plan in editor: {self._file_path}",
+                severity="error",
+                timeout=6,
+            )
+
+    def stop_watching(self) -> None:
+        if self._watch_task is None:
+            return
+
+        if not self._watch_task.done():
+            self._watch_task.cancel()
+
+        self._watch_task = None

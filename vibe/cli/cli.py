@@ -5,33 +5,40 @@ from pathlib import Path
 import sys
 
 from rich import print as rprint
+from rich.console import Console
 import tomli_w
 
 from vibe import __version__
 from vibe.cli.textual_ui.app import StartupOptions, run_textual_ui
 from vibe.core.agent_loop import AgentLoop, TeleportError
-from vibe.core.agents.models import BuiltinAgentName
-from vibe.core.config import (
-    MissingAPIKeyError,
-    MissingPromptFileError,
-    VibeConfig,
-    load_dotenv_values,
-)
+from vibe.core.config import MissingAPIKeyError, VibeConfig, load_dotenv_values
 from vibe.core.config.harness_files import get_harness_files_manager
+from vibe.core.hooks.config import load_hooks_from_fs
 from vibe.core.logger import logger
 from vibe.core.paths import HISTORY_FILE
 from vibe.core.programmatic import run_programmatic
+from vibe.core.session import last_session_pointer
 from vibe.core.session.session_loader import SessionLoader
+from vibe.core.telemetry.build_metadata import build_entrypoint_metadata
+from vibe.core.telemetry.types import EntrypointMetadata
 from vibe.core.tracing import setup_tracing
-from vibe.core.types import EntrypointMetadata, LLMMessage, OutputFormat, Role
+from vibe.core.trusted_folders import find_trustable_files, trusted_folders_manager
+from vibe.core.types import LLMMessage, OutputFormat, Role
 from vibe.core.utils import ConversationLimitException
 from vibe.setup.onboarding import run_onboarding
 
 
-def get_initial_agent_name(args: argparse.Namespace) -> str:
-    if args.prompt is not None and args.agent == BuiltinAgentName.DEFAULT:
-        return BuiltinAgentName.AUTO_APPROVE
-    return args.agent
+def _build_cli_entrypoint_metadata() -> EntrypointMetadata:
+    return build_entrypoint_metadata(
+        agent_entrypoint="cli",
+        agent_version=__version__,
+        client_name="vibe_cli",
+        client_version=__version__,
+    )
+
+
+def get_initial_agent_name(args: argparse.Namespace, config: VibeConfig) -> str:
+    return args.agent or config.default_agent
 
 
 def get_prompt_from_stdin() -> str | None:
@@ -49,18 +56,42 @@ def get_prompt_from_stdin() -> str | None:
     return None
 
 
-def load_config_or_exit() -> VibeConfig:
+def load_config_or_exit(*, interactive: bool) -> VibeConfig:
     try:
         return VibeConfig.load()
-    except MissingAPIKeyError:
-        run_onboarding()
+    except MissingAPIKeyError as e:
+        if not interactive:
+            print(
+                f"Error: {e}. Set the environment variable (e.g. in ~/.vibe/.env "
+                "or your shell), or run `vibe --setup` once interactively.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        run_onboarding(entrypoint_metadata=_build_cli_entrypoint_metadata())
         return VibeConfig.load()
-    except MissingPromptFileError as e:
-        rprint(f"[yellow]Invalid system prompt id: {e}[/]")
-        sys.exit(1)
     except ValueError as e:
         rprint(f"[yellow]{e}[/]")
         sys.exit(1)
+
+
+def warn_if_workdir_trust_is_unset() -> None:
+    try:
+        cwd = Path.cwd()
+    except FileNotFoundError:
+        return
+    if cwd.resolve() == Path.home().resolve():
+        return
+    if trusted_folders_manager.is_trusted(cwd) is not None:
+        return
+    detected = find_trustable_files(cwd)
+    if not detected:
+        return
+    files_str = ", ".join(detected)
+    Console(stderr=True).print(
+        f"[yellow]Warning:[/] {cwd} is not trusted; "
+        f"project configuration ({files_str}) will be ignored. "
+        "Re-run with --trust to trust this folder temporarily."
+    )
 
 
 def bootstrap_config_files() -> None:
@@ -98,11 +129,20 @@ def load_session(
 
     session_to_load = None
     if args.continue_session:
-        session_to_load = SessionLoader.find_latest_session(config.session_logging)
+        cwd = Path.cwd().resolve()
+        pointer_session_id = last_session_pointer.load(config.session_logging)
+        if pointer_session_id:
+            session_to_load = SessionLoader.find_session_by_id(
+                pointer_session_id, config.session_logging, working_directory=cwd
+            )
+        if not session_to_load:
+            session_to_load = SessionLoader.find_latest_session(
+                config.session_logging, working_directory=cwd
+            )
         if not session_to_load:
             rprint(
                 f"[red]No previous sessions found in "
-                f"{config.session_logging.save_dir}[/]"
+                f"{config.session_logging.save_dir} for {cwd=}[/]"
             )
             sys.exit(1)
     elif args.resume is True:
@@ -135,6 +175,7 @@ def _resume_previous_session(
     _, metadata = SessionLoader.load_session(session_path)
     session_id = metadata.get("session_id", agent_loop.session_id)
     agent_loop.session_id = session_id
+    agent_loop.parent_session_id = metadata.get("parent_session_id")
     agent_loop.session_logger.resume_existing_session(session_id, session_path)
 
     logger.info(
@@ -147,12 +188,14 @@ def run_cli(args: argparse.Namespace) -> None:
     bootstrap_config_files()
 
     if args.setup:
-        run_onboarding()
+        run_onboarding(entrypoint_metadata=_build_cli_entrypoint_metadata())
         sys.exit(0)
 
     try:
-        initial_agent_name = get_initial_agent_name(args)
-        config = load_config_or_exit()
+        is_interactive = args.prompt is None
+        config = load_config_or_exit(interactive=is_interactive)
+        initial_agent_name = get_initial_agent_name(args, config)
+        hook_config_result = load_hooks_from_fs(config)
         setup_tracing(config)
 
         if args.enabled_tools:
@@ -162,7 +205,12 @@ def run_cli(args: argparse.Namespace) -> None:
 
         stdin_prompt = get_prompt_from_stdin()
         if args.prompt is not None:
-            config.disabled_tools = [*config.disabled_tools, "ask_user_question"]
+            warn_if_workdir_trust_is_unset()
+            config.disabled_tools = [
+                *config.disabled_tools,
+                "ask_user_question",
+                "exit_plan_mode",
+            ]
             programmatic_prompt = args.prompt or stdin_prompt
             if not programmatic_prompt:
                 print(
@@ -179,10 +227,13 @@ def run_cli(args: argparse.Namespace) -> None:
                     prompt=programmatic_prompt or "",
                     max_turns=args.max_turns,
                     max_price=args.max_price,
+                    max_session_tokens=args.max_tokens,
                     output_format=output_format,
                     previous_messages=loaded_session[0] if loaded_session else None,
                     agent_name=initial_agent_name,
-                    teleport=args.teleport and config.nuage_enabled,
+                    teleport=args.teleport and config.vibe_code_enabled,
+                    headless=True,
+                    hook_config_result=hook_config_result,
                 )
                 if final_response:
                     print(final_response)
@@ -193,22 +244,22 @@ def run_cli(args: argparse.Namespace) -> None:
             except TeleportError as e:
                 print(f"Teleport error: {e}", file=sys.stderr)
                 sys.exit(1)
-            except RuntimeError as e:
+            except (RuntimeError, ValueError) as e:
                 print(f"Error: {e}", file=sys.stderr)
                 sys.exit(1)
         else:
-            agent_loop = AgentLoop(
-                config,
-                agent_name=initial_agent_name,
-                enable_streaming=True,
-                entrypoint_metadata=EntrypointMetadata(
-                    agent_entrypoint="cli",
-                    agent_version=__version__,
-                    client_name="vibe_cli",
-                    client_version=__version__,
-                ),
-                defer_heavy_init=True,
-            )
+            try:
+                agent_loop = AgentLoop(
+                    config,
+                    agent_name=initial_agent_name,
+                    enable_streaming=True,
+                    entrypoint_metadata=_build_cli_entrypoint_metadata(),
+                    defer_heavy_init=True,
+                    hook_config_result=hook_config_result,
+                )
+            except ValueError as e:
+                rprint(f"[red]Error:[/] {e}")
+                sys.exit(1)
 
             if loaded_session:
                 _resume_previous_session(agent_loop, *loaded_session)
@@ -219,6 +270,7 @@ def run_cli(args: argparse.Namespace) -> None:
                     initial_prompt=args.initial_prompt or stdin_prompt,
                     teleport_on_start=args.teleport,
                     show_resume_picker=args.resume is True,
+                    is_resuming_session=loaded_session is not None,
                 ),
             )
 

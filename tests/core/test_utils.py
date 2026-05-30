@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from vibe.core.utils import get_server_url_from_api_base
+from vibe.core.utils import compact_complete_display, get_server_url_from_api_base
 import vibe.core.utils.io as io_utils
 from vibe.core.utils.io import decode_safe, read_safe, read_safe_async
 
@@ -21,6 +21,20 @@ from vibe.core.utils.io import decode_safe, read_safe, read_safe_async
 )
 def test_get_server_url_from_api_base(api_base, expected):
     assert get_server_url_from_api_base(api_base) == expected
+
+
+class TestCompactCompleteDisplay:
+    def test_includes_session_ids_when_available(self) -> None:
+        assert compact_complete_display(
+            old_session_id="11111111-1111-1111-1111-111111111111",
+            new_session_id="22222222-2222-2222-2222-222222222222",
+        ) == (
+            "Compaction completed.\n"
+            "session: 11111111 (before compaction) → 22222222 (after compaction)"
+        )
+
+    def test_returns_base_message_without_session_ids(self) -> None:
+        assert compact_complete_display() == "Compaction completed."
 
 
 class TestReadSafe:
@@ -82,6 +96,79 @@ class TestReadSafe:
     def test_file_not_found_raises(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError):
             read_safe(tmp_path / "nope.txt")
+
+
+class TestReadSafeNewlines:
+    def test_lf(self, tmp_path: Path) -> None:
+        f = tmp_path / "lf.txt"
+        f.write_bytes(b"a\nb\nc\n")
+        got = read_safe(f)
+        assert got.text == "a\nb\nc\n"
+        assert got.newline == "\n"
+
+    def test_crlf(self, tmp_path: Path) -> None:
+        f = tmp_path / "crlf.txt"
+        f.write_bytes(b"a\r\nb\r\nc\r\n")
+        got = read_safe(f)
+        assert got.text == "a\nb\nc\n"
+        assert got.newline == "\r\n"
+
+    def test_cr(self, tmp_path: Path) -> None:
+        f = tmp_path / "cr.txt"
+        f.write_bytes(b"a\rb\rc\r")
+        got = read_safe(f)
+        assert got.text == "a\nb\nc\n"
+        assert got.newline == "\r"
+
+    def test_mixed_picks_most_frequent(self, tmp_path: Path) -> None:
+        f = tmp_path / "mixed.txt"
+        f.write_bytes(b"a\r\nb\r\nc\rd\n")
+        got = read_safe(f)
+        assert got.text == "a\nb\nc\nd\n"
+        assert got.newline == "\r\n"
+
+    @pytest.mark.parametrize(("linesep", "expected"), [("\n", "\n"), ("\r\n", "\r\n")])
+    def test_no_newline_defaults_to_os_linesep(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        linesep: str,
+        expected: str,
+    ) -> None:
+        monkeypatch.setattr(io_utils.os, "linesep", linesep)
+        f = tmp_path / "single.txt"
+        f.write_bytes(b"hello")
+        got = read_safe(f)
+        assert got.text == "hello"
+        assert got.newline == expected
+
+    @pytest.mark.parametrize(("linesep", "expected"), [("\n", "\n"), ("\r\n", "\r\n")])
+    def test_empty_defaults_to_os_linesep(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        linesep: str,
+        expected: str,
+    ) -> None:
+        monkeypatch.setattr(io_utils.os, "linesep", linesep)
+        f = tmp_path / "empty.txt"
+        f.write_bytes(b"")
+        got = read_safe(f)
+        assert got.text == ""
+        assert got.newline == expected
+
+    def test_decode_safe_reports_newline(self) -> None:
+        got = decode_safe(b"a\r\nb\r\n")
+        assert got.text == "a\nb\n"
+        assert got.newline == "\r\n"
+
+    @pytest.mark.asyncio
+    async def test_async_reports_newline(self, tmp_path: Path) -> None:
+        f = tmp_path / "crlf.txt"
+        f.write_bytes(b"a\r\nb\r\n")
+        got = await read_safe_async(f)
+        assert got.text == "a\nb\n"
+        assert got.newline == "\r\n"
 
 
 class TestReadSafeResultEncoding:

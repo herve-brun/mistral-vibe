@@ -7,6 +7,7 @@ from tests.mock.mock_backend_factory import mock_backend_factory
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
 from vibe.core import run_programmatic
+from vibe.core.agents.models import BuiltinAgentName
 from vibe.core.types import Backend, LLMMessage, OutputFormat, Role
 
 
@@ -66,6 +67,7 @@ def test_run_programmatic_preload_streaming_is_batched(
             prompt="Can you summarize what decorators are?",
             output_format=OutputFormat.STREAMING,
             previous_messages=previous,
+            agent_name=BuiltinAgentName.AUTO_APPROVE,
         )
 
         roles = [r for r, _ in spy.emitted]
@@ -80,9 +82,14 @@ def test_run_programmatic_preload_streaming_is_batched(
         new_session = [
             e for e in telemetry_events if e.get("event_name") == "vibe.new_session"
         ]
-        assert len(new_session) == 1
-        assert new_session[0]["properties"]["entrypoint"] == "programmatic"
-        assert "version" in new_session[0]["properties"]
+
+        assert len(new_session) == 0
+
+        session_closed = [
+            e for e in telemetry_events if e.get("event_name") == "vibe.session_closed"
+        ]
+        assert len(session_closed) == 1
+        assert session_closed[0]["properties"]["agent_entrypoint"] == "programmatic"
 
         assert (
             spy.emitted[0][1] == "You are Vibe, a super useful programming assistant."
@@ -131,6 +138,7 @@ def test_run_programmatic_ignores_system_messages_in_previous(
                     content="Second system message that should be ignored.",
                 ),
             ],
+            agent_name=BuiltinAgentName.AUTO_APPROVE,
         )
 
         roles = [r for r, _ in spy.emitted]
@@ -163,7 +171,7 @@ def test_run_programmatic_teleport_ignored_when_nuage_disabled(
             include_prompt_detail=False,
             include_model_info=False,
             include_commit_signature=False,
-            nuage_enabled=False,
+            vibe_code_enabled=False,
         )
 
         run_programmatic(
@@ -171,6 +179,7 @@ def test_run_programmatic_teleport_ignored_when_nuage_disabled(
             prompt="Hello",
             output_format=OutputFormat.STREAMING,
             teleport=True,
+            agent_name=BuiltinAgentName.AUTO_APPROVE,
         )
 
         roles = [r for r, _ in spy.emitted]

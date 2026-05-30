@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 import json
 from typing import Any
 
@@ -14,7 +14,9 @@ from vibe.core.nuage.workflow import (
     SignalWorkflowResponse,
     UpdateWorkflowResponse,
     WorkflowExecutionListResponse,
+    WorkflowExecutionStatus,
 )
+from vibe.core.utils.http import build_ssl_context
 
 
 class WorkflowsClient:
@@ -31,7 +33,9 @@ class WorkflowsClient:
         headers: dict[str, str] = {}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
-        self._client = httpx.AsyncClient(timeout=self._timeout, headers=headers)
+        self._client = httpx.AsyncClient(
+            timeout=self._timeout, headers=headers, verify=build_ssl_context()
+        )
         return self
 
     async def __aexit__(
@@ -50,7 +54,9 @@ class WorkflowsClient:
             headers: dict[str, str] = {}
             if self._api_key:
                 headers["Authorization"] = f"Bearer {self._api_key}"
-            self._client = httpx.AsyncClient(timeout=self._timeout, headers=headers)
+            self._client = httpx.AsyncClient(
+                timeout=self._timeout, headers=headers, verify=build_ssl_context()
+            )
             self._owns_client = True
         return self._client
 
@@ -173,12 +179,16 @@ class WorkflowsClient:
         workflow_identifier: str | None = None,
         page_size: int = 50,
         next_page_token: str | None = None,
+        status: Sequence[WorkflowExecutionStatus] | None = None,
+        user_id: str = "current",
     ) -> WorkflowExecutionListResponse:
-        params: dict[str, Any] = {"page_size": page_size}
+        params: dict[str, Any] = {"page_size": page_size, "user_id": user_id}
         if workflow_identifier:
             params["workflow_identifier"] = workflow_identifier
         if next_page_token:
             params["next_page_token"] = next_page_token
+        if status:
+            params["status"] = status
         endpoint = "/runs"
 
         try:

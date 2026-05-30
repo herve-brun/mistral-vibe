@@ -7,6 +7,7 @@ import tomllib
 from typing import TYPE_CHECKING, Any
 
 from vibe.core.paths import PLANS_DIR
+from vibe.core.utils import name_matches
 
 if TYPE_CHECKING:
     from vibe.core.config import VibeConfig
@@ -68,6 +69,15 @@ class AgentProfile:
                 *merged.get("disabled_tools", []),
             })
 
+        # Environment-level disables (set by ACP/programmatic mode) must take
+        # precedence over an agent's enabled_tools allowlist
+        if base.disabled_tools and merged.get("enabled_tools"):
+            merged["enabled_tools"] = [
+                t
+                for t in merged["enabled_tools"]
+                if not name_matches(t, base.disabled_tools)
+            ]
+
         return VC.model_validate(merged)
 
     @classmethod
@@ -116,7 +126,7 @@ CHAT = AgentProfile(
     "Chat",
     "Read-only conversational mode for questions and discussions",
     AgentSafety.SAFE,
-    overrides={"auto_approve": True, "enabled_tools": CHAT_AGENT_TOOLS},
+    overrides={"bypass_tool_permissions": True, "enabled_tools": CHAT_AGENT_TOOLS},
 )
 ACCEPT_EDITS = AgentProfile(
     BuiltinAgentName.ACCEPT_EDITS,
@@ -136,7 +146,7 @@ AUTO_APPROVE = AgentProfile(
     "Auto Approve",
     "Auto-approves all tool executions",
     AgentSafety.YOLO,
-    overrides={"auto_approve": True, "base_disabled": ["exit_plan_mode"]},
+    overrides={"bypass_tool_permissions": True, "base_disabled": ["exit_plan_mode"]},
 )
 
 EXPLORE = AgentProfile(
