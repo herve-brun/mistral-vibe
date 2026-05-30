@@ -83,10 +83,6 @@ class ToolManager:
         self._mcp_registry = mcp_registry or MCPRegistry()
         self._connector_registry = connector_registry
         self._instances: dict[str, BaseTool] = {}
-        # Track which tools came from plugins (for filtering)
-        self._plugin_tools: set[str] = set()
-        # Track which plugin contributed each tool (for usage tracking)
-        self._tool_to_plugin: dict[str, str] = {}  # tool_name -> plugin_name
         self._search_paths: list[Path] = self._compute_search_paths(self._config)
         self._lock = threading.Lock()
         self._mcp_integrated = False
@@ -205,42 +201,92 @@ class ToolManager:
                 if self._is_tool_available(cls)
             }
 
-        # Apply general tool filtering first
-        filtered_by_general = runtime_available
+        # Per-source filtering first (MCP server/connector disabled flags).
+        result = self._apply_per_source_filtering(runtime_available)
+
+        # Global overrides take precedence.
         if self._config.enabled_tools:
-            filtered_by_general = {
+            return {
                 name: cls
                 for name, cls in result.items()
                 if name_matches(name, self._config.enabled_tools)
             }
-        elif self._config.disabled_tools:
-            filtered_by_general = {
+        if self._config.disabled_tools:
+            return {
                 name: cls
                 for name, cls in result.items()
                 if not name_matches(name, self._config.disabled_tools)
             }
-
-        # Apply plugin-specific filtering
-        result = {}
-        for name, cls in filtered_by_general.items():
-            is_plugin_tool = name in self._plugin_tools
-
-            if is_plugin_tool:
-                # Plugin tool - apply plugin-specific config
-                if self._config.enabled_plugin_tools:
-                    if name_matches(name, self._config.enabled_plugin_tools):
-                        result[name] = cls
-                elif self._config.disabled_plugin_tools:
-                    if not name_matches(name, self._config.disabled_plugin_tools):
-                        result[name] = cls
-                else:
-                    # No plugin-specific config - include by default
-                    result[name] = cls
-            else:
-                # Built-in tool - already filtered above
-                result[name] = cls
-
         return result
+
+    def _is_tool_available(self, cls: type[BaseTool]) -> bool:
+        # Backwards-compatibility check to avoid breaking
+        # existing custom tools that call is_available without parameters
+        if inspect.signature(cls.is_available).parameters:
+            return cls.is_available(self._config)
+        return cls.is_available()
+
+    def _apply_per_source_filtering(
+        self, tools: dict[str, type[BaseTool]]
+    ) -> dict[str, type[BaseTool]]:
+        """Filter out MCP/connector tools disabled at the server or connector level."""
+        disabled_sources, per_source_disabled = self._build_source_disable_index()
+        if not disabled_sources and not per_source_disabled:
+            return tools
+
+        return {
+            name: cls
+            for name, cls in tools.items()
+            if not self._is_source_disabled(cls, disabled_sources, per_source_disabled)
+        }
+
+    def _build_source_disable_index(
+        self,
+    ) -> tuple[set[tuple[str, bool]], dict[tuple[str, bool], set[str]]]:
+        """Return (fully_disabled, per_tool_disabled) keyed by (source_name, is_connector)."""
+        disabled_sources: set[tuple[str, bool]] = set()
+        per_source_disabled: dict[tuple[str, bool], set[str]] = {}
+
+        for srv in self._config.mcp_servers:
+            key = (srv.name, False)
+            if srv.disabled:
+                disabled_sources.add(key)
+            elif srv.disabled_tools:
+                per_source_disabled[key] = set(srv.disabled_tools)
+
+        # Track connector names that have explicit config entries
+        configured_connectors = {cfg.name for cfg in self._config.connectors}
+
+        for cfg in self._config.connectors:
+            key = (cfg.name, True)
+            if cfg.disabled:
+                disabled_sources.add(key)
+            elif cfg.disabled_tools:
+                per_source_disabled[key] = set(cfg.disabled_tools)
+
+        # Disable connectors discovered but not in config (new connectors)
+        if self._connector_registry is not None:
+            for name in self._connector_registry.get_connector_names():
+                if name not in configured_connectors:
+                    disabled_sources.add((name, True))
+
+        return disabled_sources, per_source_disabled
+
+    @staticmethod
+    def _is_source_disabled(
+        tool_cls: type[BaseTool],
+        disabled_sources: set[tuple[str, bool]],
+        per_source_disabled: dict[tuple[str, bool], set[str]],
+    ) -> bool:
+        if not issubclass(tool_cls, MCPTool):
+            return False
+        server_name = tool_cls.get_server_name()
+        if server_name is None:
+            return False
+        key = (server_name, tool_cls.is_connector())
+        if key in disabled_sources:
+            return True
+        return tool_cls.get_remote_name() in per_source_disabled.get(key, set())
 
     def integrate_mcp(self, *, raise_on_failure: bool = False) -> None:
         """Discover and register MCP tools (sync wrapper).
@@ -395,9 +441,7 @@ class ToolManager:
         Raises:
             NoSuchToolError: If the requested tool is not available.
         """
-        # Check if we have a pre-registered instance first (from plugins)
         if tool_name in self._instances:
-            logger.debug("get(%s) found pre-registered instance", tool_name)
             return self._instances[tool_name]
 
         with self._lock:
@@ -406,106 +450,10 @@ class ToolManager:
                     f"Unknown tool: {tool_name}. Available: {list(self._available.keys())}"
                 )
             tool_class = self._available[tool_name]
-
         self._instances[tool_name] = tool_class.from_config(
             lambda: self.get_tool_config(tool_name)
         )
-
-        # Try with _tool suffix removed for LSP tools
-        if tool_name.endswith("_tool"):
-            base_name = tool_name[:-5]
-            if base_name in self._instances:
-                logger.debug(
-                    "get(%s) found pre-registered instance (stripped _tool)", tool_name
-                )
-                return self._instances[base_name]
-
         return self._instances[tool_name]
-
-    def get_instance(self, tool_name: str) -> BaseTool | None:
-        """Get a pre-registered tool instance (from plugins), without creating a new one."""
-        if tool_name in self._instances:
-            return self._instances[tool_name]
-        if tool_name.endswith("_tool") and tool_name[:-5] in self._instances:
-            return self._instances[tool_name[:-5]]
-        return None
 
     def reset_all(self) -> None:
         self._instances.clear()
-
-    def invalidate_tool(self, tool_name: str) -> None:
-        self._instances.pop(tool_name, None)
-
-    def register_dynamic_tool(self, tool_class: type[BaseTool], plugin_name: str | None = None, overwrite: bool = False) -> None:
-        """Register a tool class that was dynamically created by a plugin.
-        
-        Used by plugins to inject tools that aren't discovered from files.
-        
-        Parameters
-        ----------
-        tool_class:
-            The tool class to register
-        plugin_name:
-            Name of the plugin contributing this tool (for usage tracking)
-        overwrite:
-            If True, overwrite existing tool with the same name
-            
-        Raises
-        ------
-        TypeError
-            If tool_class is not a subclass of BaseTool
-        """
-        if not issubclass(tool_class, BaseTool) or tool_class is BaseTool:
-            raise TypeError(f"{tool_class.__name__} is not a valid tool class")
-        
-        tool_name = tool_class.get_name()
-        if tool_name in self._available:
-            if not overwrite:
-                logger.warning("Tool '%s' already registered, skipping", tool_name)
-                return
-            logger.debug("Overwriting existing tool '%s'", tool_name)
-        
-        self._available[tool_name] = tool_class
-        self._plugin_tools.add(tool_name)
-        if plugin_name:
-            self._tool_to_plugin[tool_name] = plugin_name
-            logger.debug("Registered tool '%s' from plugin '%s'", tool_name, plugin_name)
-
-    def register_dynamic_tool_instance(self, tool: BaseTool, plugin_name: str | None = None) -> None:
-        """Register a pre-configured tool instance.
-        
-        Used by plugins to inject pre-configured tool instances with
-        specific state (e.g., LSP tools with client connections).
-        
-        Parameters
-        ----------
-        tool:
-            The tool instance to register
-        plugin_name:
-            Name of the plugin contributing this tool (for usage tracking)
-        """
-        tool_name = tool.get_name()
-        if tool_name in self._instances:
-            logger.warning("Tool instance '%s' already registered, replacing", tool_name)
-        
-        self._instances[tool_name] = tool
-        self._plugin_tools.add(tool_name)
-        if plugin_name:
-            self._tool_to_plugin[tool_name] = plugin_name
-            logger.debug("Registered tool instance '%s' from plugin '%s'", tool_name, plugin_name)
-    
-    def get_plugin_for_tool(self, tool_name: str) -> str | None:
-        """Get the name of the plugin that contributed a specific tool.
-        
-        Parameters
-        ----------
-        tool_name:
-            Name of the tool to look up
-            
-        Returns
-        -------
-        str | None:
-            Name of the plugin that contributed the tool, or None if the tool
-            was not contributed by a plugin or the origin is unknown.
-        """
-        return self._tool_to_plugin.get(tool_name)

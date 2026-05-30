@@ -28,7 +28,6 @@ class BannerState:
     connectors_enabled: int = 0
     connectors_total: int = 0
     skills_count: int = 0
-    plugins_count: int = 0
     plan_description: str | None = None
 
 
@@ -45,13 +44,11 @@ class Banner(Static):
     ) -> None:
         super().__init__(**kwargs)
         self.can_focus = False
-        self._initial_state = BannerState(
-            active_model=config.active_model,
-            models_count=len(config.models),
-            mcp_servers_count=mcp_registry.count_loaded(config.mcp_servers),
-            connectors_count=_connector_count(connector_registry),
-            skills_count=skill_manager.custom_skills_count,
-            plugins_count=0,  # Will be updated later
+        self._initial_state = self._build_state(
+            config=config,
+            skill_manager=skill_manager,
+            connectors_enabled=connectors_enabled,
+            connectors_total=connectors_total,
             plan_description=None,
         )
         self._animated = not config.disable_welcome_banner_animation
@@ -94,9 +91,8 @@ class Banner(Static):
         self,
         config: VibeConfig,
         skill_manager: SkillManager,
-        mcp_registry: MCPRegistry,
-        connector_registry: ConnectorRegistry | None = None,
-        plugin_manager: Any = None,
+        connectors_enabled: int = 0,
+        connectors_total: int = 0,
         plan_description: str | None = None,
     ) -> None:
         self.state = self._build_state(
@@ -127,7 +123,6 @@ class Banner(Static):
             connectors_enabled=connectors_enabled,
             connectors_total=connectors_total,
             skills_count=skill_manager.custom_skills_count,
-            plugins_count=len(plugin_manager.all_plugins) if plugin_manager else 0,
             plan_description=plan_description,
         )
 
@@ -153,7 +148,6 @@ class Banner(Static):
             mcp_str = _pluralize(self.state.mcp_servers_enabled, "MCP server")
         parts.append(mcp_str)
         parts.append(_pluralize(self.state.skills_count, "skill"))
-        parts.append(_pluralize(self.state.plugins_count, "plugin"))
         return " · ".join(parts)
 
     def _format_plan(self) -> str:

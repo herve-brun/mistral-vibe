@@ -27,7 +27,8 @@ from textual.widget import Widget
 from textual.widgets import Static
 
 from vibe import __version__ as CORE_VERSION
-from vibe.cli.clipboard import copy_selection_to_clipboard
+from vibe.cli.clipboard import copy_selection_to_clipboard, copy_text_to_clipboard
+from vibe.cli.commands import CommandAvailabilityContext, CommandRegistry
 from vibe.cli.narrator_manager import (
     NarratorManager,
     NarratorManagerPort,
@@ -400,16 +401,6 @@ class VibeApp(App):  # noqa: PLR0904
 
         self.event_handler: EventHandler | None = None
 
-        # Use the command registry from agent_loop so plugin commands are available
-        self.commands = self.agent_loop._command_registry
-
-        # Remove excluded commands if needed
-        excluded_commands = []
-        if not self.config.nuage_enabled:
-            excluded_commands.append("teleport")
-        for command in excluded_commands:
-            self.commands.commands.pop(command, None)
-
         self._chat_input_container: ChatInputContainer | None = None
         self._current_bottom_app: BottomApp = BottomApp.Input
 
@@ -561,13 +552,10 @@ class VibeApp(App):  # noqa: PLR0904
 
         self.agent_loop.set_approval_callback(self._approval_callback)
         self.agent_loop.set_user_input_callback(self._user_input_callback)
-
-        # Start the agent loop to initialize plugins (deferred to avoid blocking UI)
-        self.call_after_refresh(self._start_agent_loop)
-
         self._refresh_profile_widgets()
 
-        self.query_one(ChatInputContainer)
+        chat_input_container = self.query_one(ChatInputContainer)
+        chat_input_container.focus_input()
         await self._resolve_plan()
         await self._show_dangerous_directory_warning()
         await self._resume_history_from_messages()
@@ -632,18 +620,6 @@ class VibeApp(App):  # noqa: PLR0904
                 self.query_one(MCPApp).refresh_index()
             except Exception:
                 pass
-
-    async def _start_agent_loop(self) -> None:
-        """Start the agent loop and initialize plugins after UI is rendered."""
-        try:
-            await self.agent_loop.start()
-            # Refresh banner after plugins are loaded
-            self.call_after_refresh(self._refresh_banner)
-            # Focus input after everything is ready
-            chat_input_container = self.query_one(ChatInputContainer)
-            chat_input_container.focus_input()
-        except Exception as exc:
-            logger.error("Failed to start agent loop: %s", exc, exc_info=True)
 
     def _process_initial_prompt(self) -> None:
         if self._teleport_on_start and self.commands.has_command("teleport"):
@@ -1002,26 +978,12 @@ class VibeApp(App):  # noqa: PLR0904
             self.agent_loop.telemetry_client.send_slash_command_used(
                 cmd_name, "builtin"
             )
-            await self._mount_and_scroll(UserMessage(user_input))
-
-            # Try to get handler from registry (for plugin commands)
-            handler = self.commands.get_handler(command.handler)
-            if handler is None:
-                # Fallback to App methods for built-in commands
-                handler = getattr(self, command.handler)
-
-            # Execute the handler and capture its return value
+            await self._mount_and_scroll(SlashCommandMessage(user_input[1:]))
+            handler = getattr(self, command.handler)
             if asyncio.iscoroutinefunction(handler):
-                result = await handler(cmd_args=cmd_args)
-            elif callable(handler):
-                result = handler(cmd_args=cmd_args)
+                await handler(cmd_args=cmd_args)
             else:
-                raise ValueError(f"Handler {handler} is not callable")
-
-            # If the handler returned a string, display it in the chat
-            if result is not None and isinstance(result, str):
-                await self._mount_and_scroll(UserCommandMessage(result))
-
+                handler(cmd_args=cmd_args)
             return True
         return False
 
@@ -1814,88 +1776,6 @@ class VibeApp(App):  # noqa: PLR0904
             return
         await self._switch_to_config_app()
 
-    async def _show_plugins_status(self, **kwargs: Any) -> None:
-        """Display the status of all active plugins in a table format."""
-        summary = self.agent_loop.plugin_manager.summary()
-        print("=== RAW SUMMARY ===\n", summary, "\n=== END RAW SUMMARY ===")
-        plugins_text = f"## Plugins Status\n\n{self._format_plugins_as_table(summary)}"
-        await self._mount_and_scroll(UserCommandMessage(plugins_text))
-
-    def _format_plugins_as_table(self, summary: str) -> str:
-        """Convert plugin summary into a markdown table, with special handling for LSP."""
-        lines = summary.split('\n')
-        table_lines = ["| Name | Description | Priority | Circuit Breaker |"]
-        table_lines.append("|------|-------------|----------|----------------|")
-        
-        current_plugin = {}
-        in_lsp_section = False
-        lsp_details = []
-        
-        for line in lines:
-            if line.startswith("### "):
-                if current_plugin:
-                    # Add LSP details to description if present
-                    if lsp_details:
-                        current_plugin["description"] += "\n\n" + "\n".join(lsp_details)
-                        lsp_details = []
-                    
-                    # Remove redundant "Configuration:" from description
-                    if "description" in current_plugin:
-                        current_plugin["description"] = current_plugin["description"].replace("Configuration:", "").strip()
-                    
-                    table_lines.append(
-                        f"| {current_plugin.get('name', '')} | {current_plugin.get('description', '')} | {current_plugin.get('priority', '')} | {current_plugin.get('circuit_breaker', '')} |"
-                    )
-                current_plugin = {"name": line[4:].strip()}
-                in_lsp_section = (line[4:].strip() == "lsp")
-            elif line.startswith("-") and "Priority:" in line:
-                current_plugin["priority"] = line.split(":")[1].strip()
-            elif line.startswith("-") and "Circuit Breaker:" in line:
-                current_plugin["circuit_breaker"] = line.split(":")[1].strip()
-            elif in_lsp_section and line.startswith("**LSP Servers:**"):
-                lsp_details.append(line)
-            elif in_lsp_section and "Detected Languages:" in line:
-                lsp_details.append(f"  {line.strip()}")
-            elif in_lsp_section and "Active Servers:" in line:
-                lsp_details.append(f"  {line.strip()}")
-            elif in_lsp_section and line.strip().startswith("-"):
-                lsp_details.append(f"    {line.strip()}")
-            elif line and not line.startswith("###") and not line.startswith("-"):
-                if "description" not in current_plugin:
-                    current_plugin["description"] = line.strip()
-                else:
-                    current_plugin["description"] += " " + line.strip()
-        
-        if current_plugin:
-            if lsp_details:
-                current_plugin["description"] += "\n\n" + "\n".join(lsp_details)
-            # Remove redundant "Configuration:" from description
-            if "description" in current_plugin:
-                current_plugin["description"] = current_plugin["description"].replace("Configuration:", "").strip()
-            table_lines.append(
-                f"| {current_plugin.get('name', '')} | {current_plugin.get('description', '')} | {current_plugin.get('priority', '')} | {current_plugin.get('circuit_breaker', '')} |"
-            )
-        
-        return "\n".join(table_lines)
-
-    async def _show_plugin_stats(self, **kwargs: Any) -> None:
-        """Display plugin usage statistics in a table format."""
-        stats = self.agent_loop.plugin_manager.get_plugin_statistics()
-        if not stats:
-            await self._mount_and_scroll(UserCommandMessage("No plugin statistics available."))
-            return
-        
-        table_lines = ["| Plugin | Calls | Errors | Total Time (s) | Avg Time (s) | Circuit Breaker |"]
-        table_lines.append("|--------|-------|--------|----------------|--------------|----------------|")
-        
-        for plugin_data in stats:
-            table_lines.append(
-                f"| {plugin_data['name']} | {plugin_data.get('calls', 0)} | {plugin_data.get('errors', 0)} | {plugin_data.get('total_time', 0.0):.2f} | {plugin_data.get('avg_time', 0.0):.2f} | {plugin_data.get('circuit_breaker', 'N/A')} |"
-            )
-        
-        stats_text = "## Plugin Statistics\n\n" + "\n".join(table_lines)
-        await self._mount_and_scroll(UserCommandMessage(stats_text))
-
     async def _show_model(self, **kwargs: Any) -> None:
         """Switch to the model picker in the bottom panel."""
         if self._current_bottom_app == BottomApp.ModelPicker:
@@ -1921,40 +1801,52 @@ class VibeApp(App):  # noqa: PLR0904
     async def _show_data_retention(self, **kwargs: Any) -> None:
         await self._mount_and_scroll(UserCommandMessage(DATA_RETENTION_MESSAGE))
 
-    async def _adjust_plugin_priority(self, cmd_args: str = "", **kwargs: Any) -> None:
-        """Adjust the priority of a plugin."""
-        try:
-            # Parse arguments
-            parts = cmd_args.strip().split()
-            if len(parts) != 2:
-                error_msg = (
-                    "[red]Error:[/] Usage: /adjust-priority <plugin_name> <priority>\n"
-                    "Example: /adjust-priority my_plugin 100"
+    async def _rename_local_session(self, title: str) -> str:
+        session_logger = self.agent_loop.session_logger
+        if not session_logger.enabled or session_logger.session_metadata is None:
+            raise ValueError("Session logging is disabled in configuration.")
+
+        if (
+            session_logger.session_dir is not None
+            and session_logger.metadata_filepath.exists()
+        ):
+            await update_saved_session_title_at_path(session_logger.session_dir, title)
+
+        session_logger.set_title(title)
+        renamed_title = session_logger.session_metadata.title
+        assert renamed_title is not None
+        return renamed_title
+
+    async def _rename_session(self, cmd_args: str = "", **kwargs: Any) -> None:
+        if self._remote_manager.is_active:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "Renaming is only supported for local sessions.",
+                    collapsed=self._tools_collapsed,
                 )
-                await self._mount_and_scroll(UserCommandMessage(error_msg))
-                return
-            
-            plugin_name = parts[0]
-            try:
-                priority = int(parts[1])
-            except ValueError:
-                error_msg = f"[red]Error:[/] Priority must be an integer, got: {parts[1]}"
-                await self._mount_and_scroll(UserCommandMessage(error_msg))
-                return
-            
-            # Call the agent loop method
-            success = self.agent_loop.adjust_plugin_priority(plugin_name, priority)
-            
-            if success:
-                result_msg = f"✅ Adjusted priority for plugin '{plugin_name}' to {priority}"
-            else:
-                result_msg = f"⚠ Plugin '{plugin_name}' not found"
-            
-            await self._mount_and_scroll(UserCommandMessage(result_msg))
-            
+            )
+            return
+
+        title = cmd_args.strip()
+        if not title:
+            await self._mount_and_scroll(
+                ErrorMessage("Usage: /rename <title>", collapsed=self._tools_collapsed)
+            )
+            return
+
+        try:
+            renamed_title = await self._rename_local_session(title)
         except Exception as e:
-            error_msg = f"[red]Error:[/] Failed to adjust plugin priority: {e}"
-            await self._mount_and_scroll(UserCommandMessage(error_msg))
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    f"Failed to rename session: {e}", collapsed=self._tools_collapsed
+                )
+            )
+            return
+
+        await self._mount_and_scroll(
+            UserCommandMessage(f'Session renamed to "{renamed_title}".')
+        )
 
     async def _show_session_picker(self, **kwargs: Any) -> None:
         cwd = str(Path.cwd())
@@ -2963,9 +2855,8 @@ class VibeApp(App):  # noqa: PLR0904
             self._banner.set_state(
                 self.config,
                 self.agent_loop.skill_manager,
-                self.agent_loop.mcp_registry,
-                connector_registry=self.agent_loop.connector_registry,
-                plugin_manager=self.agent_loop.plugin_manager,
+                connectors_enabled=ce,
+                connectors_total=ct,
                 plan_description=plan_title(self._plan_info),
             )
 

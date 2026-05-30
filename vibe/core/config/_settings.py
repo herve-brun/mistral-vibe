@@ -32,6 +32,7 @@ def deep_update(base: dict, updates: dict) -> dict:
         else:
             result[key] = value
     return result
+from textual.theme import BUILTIN_THEMES
 import tomli_w
 
 from vibe.core.agents.models import BuiltinAgentName
