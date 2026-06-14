@@ -18,6 +18,10 @@ def test_get_universal_system_prompt_includes_windows_prompt_on_windows(
 ) -> None:
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setenv("COMSPEC", "C:\\Windows\\System32\\cmd.exe")
+    # Mock get_shell_executable to return None (no bash available) to test cmd.exe fallback
+    monkeypatch.setattr(
+        "vibe.core.system_prompt.get_shell_executable", lambda config=None: None
+    )
 
     config = build_test_vibe_config(
         system_prompt_id="tests",
@@ -44,6 +48,33 @@ def test_get_universal_system_prompt_includes_windows_prompt_on_windows(
     assert "Use: backslashes (\\\\) for paths" in prompt
     assert "Check command availability with: `where command` (Windows)" in prompt
     assert "Script shebang: Not applicable on Windows" in prompt
+
+
+def test_system_prompt_respects_vibe_shell_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("VIBE_SHELL", "C:\\custom\\bash.exe")
+
+    config = build_test_vibe_config(
+        system_prompt_id="tests",
+        include_project_context=False,
+        include_prompt_detail=True,
+        include_model_info=False,
+        include_commit_signature=False,
+    )
+    tool_manager = ToolManager(lambda: config)
+    skill_manager = SkillManager(lambda: config)
+    agent_manager = AgentManager(lambda: config)
+
+    prompt = get_universal_system_prompt(
+        tool_manager, config, skill_manager, agent_manager
+    )
+
+    assert "You are Vibe, a super useful programming assistant." in prompt
+    assert "The operating system is Windows with shell `C:\\custom\\bash.exe`" in prompt
+    assert "Bash is available (Git Bash / Mingw64 / Cygwin)" in prompt
+    assert "Unix commands like `ls`, `grep`, `cat` work" in prompt
 
 
 def test_scratchpad_section_included_when_passed() -> None:
